@@ -121,6 +121,7 @@ window.__ModuleLoader__.load({
             const [personas, setPersonas] = react.useState([]);
             const [personaId, setPersonaId] = react.useState("");
             const [personaPrompt, setPersonaPrompt] = react.useState("");
+            const [personaNew, setPersonaNew] = react.useState(null);
 
             const [providers, setProviders] = react.useState([]);
             const [providerEdit, setProviderEdit] = react.useState(null);
@@ -131,6 +132,9 @@ window.__ModuleLoader__.load({
             const [modelSelection, setModelSelection] = react.useState({ provider_id: "", fallback: [] });
             const [env, setEnv] = react.useState(null);
             const [adminQQ, setAdminQQ] = react.useState("");
+            const [workspace, setWorkspace] = react.useState("");
+            const [advanced, setAdvanced] = react.useState({ astrbotDir: "", astrbotExe: "", napcatWebui: "", napcatToken: "" });
+            const [starting, setStarting] = react.useState(false);
             const [settingsLoaded, setSettingsLoaded] = react.useState(false);
 
             const api = async (path, options) => {
@@ -168,6 +172,28 @@ window.__ModuleLoader__.load({
                     setMessage("操作失败：" + String(err));
                 } finally {
                     setBusy(false);
+                }
+            };
+
+            const startBot = async () => {
+                setStarting(true);
+                setMessage("正在启动聊天机器人...");
+                try {
+                    await api("/admin/astrbot/start", { method: "POST" });
+                    const deadline = Date.now() + 90000;
+                    while (Date.now() < deadline) {
+                        await new Promise((resolve) => setTimeout(resolve, 2000));
+                        const data = await api("/admin/status");
+                        if (data.astrbot) {
+                            setMessage("聊天机器人已启动");
+                            await refresh();
+                            break;
+                        }
+                    }
+                } catch (err) {
+                    setMessage("启动失败：" + String(err));
+                } finally {
+                    setStarting(false);
                 }
             };
 
@@ -225,6 +251,13 @@ window.__ModuleLoader__.load({
                 try {
                     const data = await api("/admin/settings");
                     setAdminQQ(data.adminQQ || "");
+                    setWorkspace(data.workspace || "");
+                    setAdvanced({
+                        astrbotDir: data.astrbotDir || "",
+                        astrbotExe: data.astrbotExe || "",
+                        napcatWebui: data.napcatWebui || "",
+                        napcatToken: data.napcatToken || ""
+                    });
                     setSettingsLoaded(true);
                 } catch (err) {
                     setMessage("加载设置失败：" + String(err));
@@ -240,6 +273,34 @@ window.__ModuleLoader__.load({
                     await loadSettings();
                 } catch (err) {
                     setMessage("保存管理员失败：" + String(err));
+                } finally {
+                    setBusy(false);
+                }
+            };
+
+            const saveWorkspace = async () => {
+                setBusy(true);
+                setMessage("");
+                try {
+                    const data = await postJson("/admin/settings", { workspace });
+                    setMessage(data.ok ? "工作区已保存，新建会话使用新目录" : "保存失败：" + JSON.stringify(data));
+                    await loadSettings();
+                } catch (err) {
+                    setMessage("保存工作区失败：" + String(err));
+                } finally {
+                    setBusy(false);
+                }
+            };
+
+            const saveAdvanced = async () => {
+                setBusy(true);
+                setMessage("");
+                try {
+                    const data = await postJson("/admin/settings", advanced);
+                    setMessage(data.ok ? "高级设置已保存" : "保存失败：" + JSON.stringify(data));
+                    await loadSettings();
+                } catch (err) {
+                    setMessage("保存高级设置失败：" + String(err));
                 } finally {
                     setBusy(false);
                 }
@@ -306,6 +367,31 @@ window.__ModuleLoader__.load({
                     setMessage(data.status === "ok" ? "人格已保存，重新对话后生效" : "保存失败：" + JSON.stringify(data));
                 } catch (err) {
                     setMessage("保存人格失败：" + String(err));
+                } finally {
+                    setBusy(false);
+                }
+            };
+
+            const createPersona = async () => {
+                if (!personaNew || !personaNew.id) {
+                    setMessage("请填写人格 ID");
+                    return;
+                }
+                setBusy(true);
+                setMessage("");
+                try {
+                    const newId = personaNew.id;
+                    const data = await postJson("/admin/persona-create", { persona_id: newId, system_prompt: "你是一个助手。" });
+                    if (data.status === "ok") {
+                        setMessage("人格已创建，现在可以编辑内容");
+                        setPersonaNew(null);
+                        await loadPersonas();
+                        await selectPersona(newId);
+                    } else {
+                        setMessage("创建失败：" + JSON.stringify(data));
+                    }
+                } catch (err) {
+                    setMessage("创建人格失败：" + String(err));
                 } finally {
                     setBusy(false);
                 }
@@ -448,23 +534,39 @@ window.__ModuleLoader__.load({
                 react.createElement("div", { style: styles.label }, "管理员 QQ"),
                 react.createElement(
                     "div",
-                    { style: { display: "flex", gap: "10px" } },
+                    { style: { display: "flex", gap: "10px", alignItems: "center" } },
                     react.createElement("input", {
-                        style: styles.input,
+                        style: { ...styles.input, flex: 1, minWidth: 0 },
                         placeholder: "机器人只响应这个 QQ 号发起的任务",
                         value: adminQQ,
                         onChange: (event) => setAdminQQ(event.target.value)
                     }),
                     react.createElement("button", {
-                        style: styles.primaryButton,
+                        style: { ...styles.primaryButton, flexShrink: 0, marginRight: 0 },
                         disabled: busy,
                         onClick: saveAdminQQ
+                    }, "保存")
+                ),
+                react.createElement("div", { style: { ...styles.label, marginTop: "16px" } }, "工作区目录"),
+                react.createElement(
+                    "div",
+                    { style: { display: "flex", gap: "10px", alignItems: "center" } },
+                    react.createElement("input", {
+                        style: { ...styles.input, flex: 1, minWidth: 0 },
+                        placeholder: "机器人执行任务的目录，例如 D:\\bot-workspace",
+                        value: workspace,
+                        onChange: (event) => setWorkspace(event.target.value)
+                    }),
+                    react.createElement("button", {
+                        style: { ...styles.primaryButton, flexShrink: 0, marginRight: 0 },
+                        disabled: busy,
+                        onClick: saveWorkspace
                     }, "保存")
                 ),
                 react.createElement(
                     "div",
                     { style: { color: "var(--dsw-alias-label-secondary)", fontSize: "12px", marginTop: "8px" } },
-                    settingsLoaded ? "修改后需要重启聊天机器人才能生效" : "正在读取设置..."
+                    settingsLoaded ? "管理员修改后需要重启聊天机器人；工作区对之后新建的会话生效" : "正在读取设置..."
                 )
             );
 
@@ -495,9 +597,9 @@ window.__ModuleLoader__.load({
                             null,
                             react.createElement("button", {
                                 style: styles.primaryButton,
-                                disabled: busy || astrbotOk,
-                                onClick: () => run("/admin/astrbot/start")
-                            }, "启动"),
+                                disabled: busy || astrbotOk || starting,
+                                onClick: startBot
+                            }, starting ? "正在启动..." : "启动"),
                             react.createElement("button", {
                                 style: styles.button,
                                 disabled: busy || !astrbotOk,
@@ -610,7 +712,33 @@ window.__ModuleLoader__.load({
                 react.createElement(
                     "div",
                     { style: styles.card },
-                    react.createElement("div", { style: styles.label }, "选择人格"),
+                    react.createElement(
+                        "div",
+                        { style: { ...styles.row, marginBottom: "8px" } },
+                        react.createElement("div", { style: styles.label }, "选择人格"),
+                        react.createElement("button", {
+                            style: styles.button,
+                            disabled: busy,
+                            onClick: () => setPersonaNew(personaNew ? null : { id: "" })
+                        }, personaNew ? "收起" : "新建人格")
+                    ),
+                    personaNew
+                        ? react.createElement(
+                            "div",
+                            { style: { display: "flex", gap: "10px", marginBottom: "12px" } },
+                            react.createElement("input", {
+                                style: { ...styles.input, flex: 1, minWidth: 0 },
+                                placeholder: "人格 ID，例如 kefu",
+                                value: personaNew.id,
+                                onChange: (event) => setPersonaNew({ ...personaNew, id: event.target.value })
+                            }),
+                            react.createElement("button", {
+                                style: { ...styles.primaryButton, flexShrink: 0, marginRight: 0 },
+                                disabled: busy,
+                                onClick: createPersona
+                            }, "创建")
+                        )
+                        : null,
                     react.createElement(
                         "div",
                         { style: { display: "flex", flexWrap: "wrap", gap: "8px", marginBottom: "16px" } },
@@ -939,6 +1067,45 @@ window.__ModuleLoader__.load({
                         "NapCat 会从 GitHub 下载最新发布包并解压到配置目录，网络慢时可能失败，可重试。",
                         react.createElement("br", null),
                         "全部就绪后到“进程”页启动进程，并用二维码扫码登录。"
+                    )
+                ),
+                react.createElement(
+                    "div",
+                    { style: styles.card },
+                    react.createElement("div", { style: styles.label }, "高级设置"),
+                    react.createElement("div", { style: { ...styles.label, marginTop: "4px" } }, "聊天机器人目录"),
+                    react.createElement("input", {
+                        style: styles.input,
+                        value: advanced.astrbotDir,
+                        onChange: (event) => setAdvanced({ ...advanced, astrbotDir: event.target.value })
+                    }),
+                    react.createElement("div", { style: { ...styles.label, marginTop: "10px" } }, "聊天机器人启动程序"),
+                    react.createElement("input", {
+                        style: styles.input,
+                        value: advanced.astrbotExe,
+                        onChange: (event) => setAdvanced({ ...advanced, astrbotExe: event.target.value })
+                    }),
+                    react.createElement("div", { style: { ...styles.label, marginTop: "10px" } }, "NapCat 管理地址"),
+                    react.createElement("input", {
+                        style: styles.input,
+                        value: advanced.napcatWebui,
+                        onChange: (event) => setAdvanced({ ...advanced, napcatWebui: event.target.value })
+                    }),
+                    react.createElement("div", { style: { ...styles.label, marginTop: "10px" } }, "NapCat token"),
+                    react.createElement("input", {
+                        style: styles.input,
+                        type: "password",
+                        value: advanced.napcatToken,
+                        onChange: (event) => setAdvanced({ ...advanced, napcatToken: event.target.value })
+                    }),
+                    react.createElement(
+                        "div",
+                        { style: { marginTop: "14px" } },
+                        react.createElement("button", {
+                            style: styles.primaryButton,
+                            disabled: busy,
+                            onClick: saveAdvanced
+                        }, "保存高级设置")
                     )
                 ),
                 env && env.installLog && Object.keys(env.installLog).length > 0

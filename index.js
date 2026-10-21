@@ -775,22 +775,59 @@ export function apply(ctx, pluginConfig) {
                     adminQQ: config.adminQQ || '',
                     workspace: config.workspace,
                     provider: config.provider,
-                    model: config.model
+                    model: config.model,
+                    astrbotDir: config.astrbot.dir,
+                    astrbotExe: config.astrbot.exe,
+                    napcatWebui: config.napcat.webui,
+                    napcatToken: config.napcat.token
                 });
             }
 
             if (req.method === 'POST' && url.pathname === '/admin/settings') {
                 try {
                     const body = JSON.parse(await readBody(req));
+                    const configFile = path.join(__dirname, 'config.json');
+                    const data = JSON.parse(fs.readFileSync(configFile, 'utf8'));
                     if (typeof body.adminQQ === 'string') {
                         config.adminQQ = body.adminQQ.trim();
-                        const configFile = path.join(__dirname, 'config.json');
-                        const data = JSON.parse(fs.readFileSync(configFile, 'utf8'));
                         data.adminQQ = config.adminQQ;
-                        fs.writeFileSync(configFile, JSON.stringify(data, null, 2), 'utf8');
                         log(`管理员 QQ 已更新: ${config.adminQQ}`);
                     }
-                    return sendJson(res, 200, { ok: true, adminQQ: config.adminQQ || '' });
+                    if (typeof body.workspace === 'string' && body.workspace.trim()) {
+                        config.workspace = body.workspace.trim();
+                        data.workspace = config.workspace;
+                        log(`工作区已更新: ${config.workspace}`);
+                    }
+                    if (typeof body.astrbotDir === 'string' && body.astrbotDir.trim()) {
+                        config.astrbot.dir = body.astrbotDir.trim();
+                        data.astrbot.dir = config.astrbot.dir;
+                        log(`聊天机器人目录已更新: ${config.astrbot.dir}`);
+                    }
+                    if (typeof body.astrbotExe === 'string' && body.astrbotExe.trim()) {
+                        config.astrbot.exe = body.astrbotExe.trim();
+                        data.astrbot.exe = config.astrbot.exe;
+                        log(`聊天机器人启动程序已更新: ${config.astrbot.exe}`);
+                    }
+                    if (typeof body.napcatWebui === 'string' && body.napcatWebui.trim()) {
+                        config.napcat.webui = body.napcatWebui.trim();
+                        data.napcat.webui = config.napcat.webui;
+                        log(`NapCat 管理地址已更新: ${config.napcat.webui}`);
+                    }
+                    if (typeof body.napcatToken === 'string') {
+                        config.napcat.token = body.napcatToken.trim();
+                        data.napcat.token = config.napcat.token;
+                        log(`NapCat token 已更新`);
+                    }
+                    fs.writeFileSync(configFile, JSON.stringify(data, null, 2), 'utf8');
+                    return sendJson(res, 200, {
+                        ok: true,
+                        adminQQ: config.adminQQ || '',
+                        workspace: config.workspace,
+                        astrbotDir: config.astrbot.dir,
+                        astrbotExe: config.astrbot.exe,
+                        napcatWebui: config.napcat.webui,
+                        napcatToken: config.napcat.token
+                    });
                 } catch (error) {
                     log(`保存设置失败: ${error.message}`);
                     return sendJson(res, 500, { error: error.message });
@@ -928,6 +965,22 @@ export function apply(ctx, pluginConfig) {
                     });
                     return sendJson(res, 200, data);
                 } catch (error) {
+                    return sendJson(res, 500, { error: error.message });
+                }
+            }
+
+            if (req.method === 'POST' && url.pathname === '/admin/persona-create') {
+                try {
+                    const body = JSON.parse(await readBody(req));
+                    if (!body.persona_id) return sendJson(res, 400, { error: '缺少 persona_id' });
+                    const data = await astrbotApi('/api/v1/personas', 'POST', {
+                        persona_id: body.persona_id,
+                        system_prompt: body.system_prompt || '你是一个助手。'
+                    });
+                    log(`已创建人格: ${body.persona_id}`);
+                    return sendJson(res, 200, data);
+                } catch (error) {
+                    log(`创建人格失败: ${error.message}`);
                     return sendJson(res, 500, { error: error.message });
                 }
             }

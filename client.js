@@ -45,13 +45,13 @@ window.__ModuleLoader__.load({
                 marginBottom: "16px"
             },
             row: { display: "flex", alignItems: "center", justifyContent: "space-between", gap: "16px" },
-            statusDot: (ok) => ({
+            statusDot: (ok, starting) => ({
                 display: "inline-block",
                 width: "10px",
                 height: "10px",
                 borderRadius: "50%",
                 marginRight: "10px",
-                background: ok ? "#2fbf71" : "#e05c5c"
+                background: ok ? "#2fbf71" : starting ? "#e6a23c" : "#e05c5c"
             }),
             button: {
                 height: "36px",
@@ -525,6 +525,7 @@ window.__ModuleLoader__.load({
             const napcatOk = status ? Boolean(status.napcat) : false;
             const qqOk = status && status.qq ? Boolean(status.qq.isLogin) : false;
             const qqReachable = status && status.qq ? Boolean(status.qq.reachable) : false;
+            const qqStarting = status && status.qq ? Boolean(status.qq.starting) : false;
 
             const tabs = [
                 ["process", "进程"],
@@ -660,11 +661,11 @@ window.__ModuleLoader__.load({
                             react.createElement(
                                 "div",
                                 { style: { fontWeight: 600 } },
-                                react.createElement("span", { style: styles.statusDot(qqOk) }),
+                                react.createElement("span", { style: styles.statusDot(qqOk, qqStarting) }),
                                 "QQ 登录状态"
                             ),
                             react.createElement("div", { style: { color: "var(--dsw-alias-label-secondary)", fontSize: "12px" } },
-                                !qqReachable ? "NapCat 不可达" : qqOk ? "已登录" : "未登录，需要扫码")
+                                !qqReachable ? (qqStarting ? "正在启动" : "NapCat 不可达") : qqOk ? "已登录" : "未登录，需要扫码")
                         ),
                         react.createElement(
                             "div",

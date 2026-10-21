@@ -331,17 +331,35 @@ export function apply(ctx, pluginConfig) {
         }
     }
 
-    async function napcatLogin() {
-        const token = config.napcat.token;
-        const sha = crypto.createHash('sha256');
-        const hash = sha.update(token + '.napcat').digest('hex');
-        const login = await fetch(config.napcat.webui + '/api/auth/login', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ hash })
-        }).then((r) => r.json());
-        if (login.code !== 0) return null;
-        return login.data.Credential;
+    let napcatCredential = null;
+    let napcatLoginPromise = null;
+
+    async function napcatLogin(force = false) {
+        if (napcatCredential && !force) return napcatCredential;
+        if (napcatLoginPromise) return napcatLoginPromise;
+        napcatLoginPromise = (async () => {
+            try {
+                const token = config.napcat.token;
+                const sha = crypto.createHash('sha256');
+                const hash = sha.update(token + '.napcat').digest('hex');
+                const response = await fetch(config.napcat.webui + '/api/auth/login', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ hash }),
+                    signal: AbortSignal.timeout(5000)
+                });
+                if (!response.ok) return null;
+                const login = await response.json();
+                if (!login || login.code !== 0 || !login.data) return null;
+                napcatCredential = login.data.Credential || null;
+                return napcatCredential;
+            } catch (error) {
+                return null;
+            } finally {
+                napcatLoginPromise = null;
+            }
+        })();
+        return napcatLoginPromise;
     }
 
     async function napcatApi(apiPath, credential, body) {
@@ -351,45 +369,78 @@ export function apply(ctx, pluginConfig) {
                 'Content-Type': 'application/json',
                 Authorization: `Bearer ${credential}`
             },
-            body: JSON.stringify(body || {})
+            body: JSON.stringify(body || {}),
+            signal: AbortSignal.timeout(8000)
         });
+        if (response.status === 401) {
+            const error = new Error('NapCat 凭据失效');
+            error.code = 'NAPCAT_AUTH';
+            throw error;
+        }
         return response.json();
     }
 
     async function getQqStatus() {
-        try {
-            const credential = await napcatLogin();
-            if (!credential) return { reachable: false };
-            const status = await napcatApi('/api/QQLogin/CheckLoginStatus', credential);
-            const data = status.data || {};
-            return {
-                reachable: true,
-                isLogin: Boolean(data.isLogin),
-                loginPhase: data.loginPhase || '',
-                qrcodeurl: data.qrcodeurl || ''
-            };
-        } catch (error) {
-            return { reachable: false, error: error.message };
+        let lastError = '';
+        for (let attempt = 0; attempt < 2; attempt++) {
+            try {
+                const credential = await napcatLogin(attempt > 0);
+                if (!credential) {
+                    lastError = 'NapCat 登录失败';
+                    continue;
+                }
+                const status = await napcatApi('/api/QQLogin/CheckLoginStatus', credential);
+                if (!status || status.code !== 0) {
+                    lastError = (status && status.message) || 'NapCat 返回异常';
+                    napcatCredential = null;
+                    continue;
+                }
+                const data = status.data || {};
+                return {
+                    reachable: true,
+                    isLogin: Boolean(data.isLogin),
+                    loginPhase: data.loginPhase || '',
+                    qrcodeurl: data.qrcodeurl || ''
+                };
+            } catch (error) {
+                lastError = error.message;
+                napcatCredential = null;
+            }
         }
+        return { reachable: false, error: lastError };
     }
 
     async function getQrCode() {
-        try {
-            const credential = await napcatLogin();
-            if (!credential) return { error: 'NapCat 不可达' };
+        let lastError = '';
+        for (let attempt = 0; attempt < 2; attempt++) {
             try {
-                await napcatApi('/api/QQLogin/RefreshQRcode', credential);
+                const credential = await napcatLogin(attempt > 0);
+                if (!credential) {
+                    lastError = 'NapCat 登录失败';
+                    continue;
+                }
+                try {
+                    await napcatApi('/api/QQLogin/RefreshQRcode', credential);
+                } catch (error) {
+                    if (error.code === 'NAPCAT_AUTH') {
+                        napcatCredential = null;
+                        continue;
+                    }
+                }
+                const qr = await napcatApi('/api/QQLogin/GetQQLoginQrcode', credential);
+                if (qr.code !== 0 || !qr.data || !qr.data.qrcode) {
+                    const message = qr.message || '没有二维码';
+                    if (/logined/i.test(message)) return { error: 'QQ 已登录，无需获取二维码' };
+                    return { error: message };
+                }
+                return { link: qr.data.qrcode };
             } catch (error) {
-                // 刷新失败时继续尝试读取现有二维码
+                lastError = error.message;
+                napcatCredential = null;
             }
-            const qr = await napcatApi('/api/QQLogin/GetQQLoginQrcode', credential);
-            if (qr.code !== 0 || !qr.data || !qr.data.qrcode) {
-                return { error: qr.message || '没有二维码' };
-            }
-            return { link: qr.data.qrcode };
-        } catch (error) {
-            return { error: error.message };
         }
+        if (await isPortOpen(6099)) return { error: 'NapCat 正在启动，请稍后重试' };
+        return { error: 'NapCat 不可达' };
     }
 
     let astrbotToken = null;
@@ -772,10 +823,12 @@ export function apply(ctx, pluginConfig) {
             }
 
             if (req.method === 'GET' && url.pathname === '/admin/status') {
+                const napcatPortOpen = await isPortOpen(6099);
                 const qq = await getQqStatus();
+                if (!qq.reachable && napcatPortOpen) qq.starting = true;
                 return sendJson(res, 200, {
                     astrbot: await isPortOpen(6185),
-                    napcat: await isPortOpen(6099),
+                    napcat: napcatPortOpen,
                     bridge: true,
                     adminQQ: config.adminQQ || '',
                     qq

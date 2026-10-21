@@ -155,6 +155,10 @@ window.__ModuleLoader__.load({
                     const data = await api("/admin/status");
                     setStatus(data);
                     setError("");
+                    if (data.qq && data.qq.isLogin) {
+                        setQrImg("");
+                        setQrLink("");
+                    }
                 } catch (err) {
                     setStatus(null);
                     setError("桥接服务不可达：" + String(err));
@@ -205,11 +209,13 @@ window.__ModuleLoader__.load({
 
             const loadQr = async () => {
                 setBusy(true);
+                setQrImg("");
+                setQrLink("");
                 try {
                     const data = await api("/admin/qr");
                     if (data.link) {
                         setQrLink(data.link);
-                        setQrImg(BRIDGE + "/admin/qr.png?t=" + Date.now());
+                        setQrImg(BRIDGE + "/admin/qr.png?link=" + encodeURIComponent(data.link) + "&t=" + Date.now());
                         setMessage("二维码已加载");
                     } else {
                         setMessage("获取二维码失败：" + (data.error || "未知错误"));
@@ -681,6 +687,10 @@ window.__ModuleLoader__.load({
                         ? react.createElement("img", {
                             src: qrImg,
                             alt: "QQ 登录二维码",
+                            onError: () => {
+                                setQrImg("");
+                                setMessage("二维码图片加载失败，请重试");
+                            },
                             style: {
                                 marginTop: "12px",
                                 width: "220px",

@@ -974,7 +974,16 @@ export function apply(ctx, pluginConfig) {
             }
 
             if (req.method === 'GET' && url.pathname === '/admin/qr.png') {
-                const qr = await getQrCode();
+                const requested = url.searchParams.get('link') || '';
+                let qr;
+                if (requested) {
+                    if (requested.length > 2048 || !/^https?:\/\//i.test(requested)) {
+                        return sendJson(res, 400, { error: '二维码链接无效' });
+                    }
+                    qr = { link: requested };
+                } else {
+                    qr = await getQrCode();
+                }
                 if (!qr.link) return sendJson(res, 404, qr);
                 try {
                     execFileSync(config.pythonExe, [config.qrScript, qr.link, config.qrImageFile], { timeout: 20000 });

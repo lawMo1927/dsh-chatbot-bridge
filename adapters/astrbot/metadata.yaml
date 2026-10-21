@@ -1,0 +1,4 @@
+name: astrbot_plugin_dsh_bridge
+desc: 把 QQ 私聊任务转交给 DSH 执行，并把结果回传到 QQ
+author: dsh-chatbot-bridge
+version: 0.1.0

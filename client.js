@@ -130,6 +130,8 @@ window.__ModuleLoader__.load({
             const [modelSettings, setModelSettings] = react.useState(null);
             const [modelSelection, setModelSelection] = react.useState({ provider_id: "", fallback: [] });
             const [env, setEnv] = react.useState(null);
+            const [adminQQ, setAdminQQ] = react.useState("");
+            const [settingsLoaded, setSettingsLoaded] = react.useState(false);
 
             const api = async (path, options) => {
                 const response = await fetch(BRIDGE + path, options);
@@ -214,6 +216,58 @@ window.__ModuleLoader__.load({
                     await loadEnv();
                 } catch (err) {
                     setMessage("安装请求失败：" + String(err));
+                } finally {
+                    setBusy(false);
+                }
+            };
+
+            const loadSettings = async () => {
+                try {
+                    const data = await api("/admin/settings");
+                    setAdminQQ(data.adminQQ || "");
+                    setSettingsLoaded(true);
+                } catch (err) {
+                    setMessage("加载设置失败：" + String(err));
+                }
+            };
+
+            const saveAdminQQ = async () => {
+                setBusy(true);
+                setMessage("");
+                try {
+                    const data = await postJson("/admin/settings", { adminQQ });
+                    setMessage(data.ok ? "管理员已保存，重启聊天机器人后生效" : "保存失败：" + JSON.stringify(data));
+                    await loadSettings();
+                } catch (err) {
+                    setMessage("保存管理员失败：" + String(err));
+                } finally {
+                    setBusy(false);
+                }
+            };
+
+            const loadPersonaTemplate = async () => {
+                try {
+                    const data = await api("/admin/persona-template");
+                    if (data.template) {
+                        setPersonaPrompt(data.template);
+                        setMessage("已载入默认模板，保存后生效");
+                    } else {
+                        setMessage(data.error || "没有默认模板");
+                    }
+                } catch (err) {
+                    setMessage("载入模板失败：" + String(err));
+                }
+            };
+
+            const installAstrbotPlugin = async () => {
+                setBusy(true);
+                setMessage("");
+                try {
+                    const data = await postJson("/admin/astrbot/plugin/install", {});
+                    setMessage(data.ok ? "插件已安装到 AstrBot，重启聊天机器人后生效" : "安装失败：" + (data.error || JSON.stringify(data)));
+                    await loadEnv();
+                } catch (err) {
+                    setMessage("安装失败：" + String(err));
                 } finally {
                     setBusy(false);
                 }
@@ -361,6 +415,7 @@ window.__ModuleLoader__.load({
             react.useEffect(() => {
                 if (tab === "process") {
                     refresh();
+                    loadSettings();
                     const timer = setInterval(refresh, 5000);
                     return () => clearInterval(timer);
                 }
@@ -387,9 +442,36 @@ window.__ModuleLoader__.load({
                 ["logs", "日志"]
             ];
 
+            const adminCard = react.createElement(
+                "div",
+                { style: styles.card },
+                react.createElement("div", { style: styles.label }, "管理员 QQ"),
+                react.createElement(
+                    "div",
+                    { style: { display: "flex", gap: "10px" } },
+                    react.createElement("input", {
+                        style: styles.input,
+                        placeholder: "机器人只响应这个 QQ 号发起的任务",
+                        value: adminQQ,
+                        onChange: (event) => setAdminQQ(event.target.value)
+                    }),
+                    react.createElement("button", {
+                        style: styles.primaryButton,
+                        disabled: busy,
+                        onClick: saveAdminQQ
+                    }, "保存")
+                ),
+                react.createElement(
+                    "div",
+                    { style: { color: "var(--dsw-alias-label-secondary)", fontSize: "12px", marginTop: "8px" } },
+                    settingsLoaded ? "修改后需要重启聊天机器人才能生效" : "正在读取设置..."
+                )
+            );
+
             const processTab = react.createElement(
                 "div",
                 null,
+                adminCard,
                 react.createElement(
                     "div",
                     { style: styles.card },
@@ -554,6 +636,11 @@ window.__ModuleLoader__.load({
                             disabled: busy || !personaId,
                             onClick: savePersona
                         }, "保存人格"),
+                        react.createElement("button", {
+                            style: styles.button,
+                            disabled: busy,
+                            onClick: loadPersonaTemplate
+                        }, "载入默认模板"),
                         react.createElement("button", {
                             style: styles.button,
                             disabled: busy,
@@ -817,6 +904,26 @@ window.__ModuleLoader__.load({
                                     : null
                             )
                         ))
+                ),
+                react.createElement(
+                    "div",
+                    { style: styles.card },
+                    react.createElement(
+                        "div",
+                        { style: styles.row },
+                        react.createElement(
+                            "div",
+                            null,
+                            react.createElement("div", { style: { fontWeight: 600 } }, "AstrBot 桥接插件"),
+                            react.createElement("div", { style: { color: "var(--dsw-alias-label-secondary)", fontSize: "12px" } },
+                                "把任务转交能力装进聊天机器人，安装到 AstrBot 插件目录")
+                        ),
+                        react.createElement("button", {
+                            style: styles.primaryButton,
+                            disabled: busy || !(env && env.astrbot && env.astrbot.installed),
+                            onClick: installAstrbotPlugin
+                        }, "安装")
+                    )
                 ),
                 react.createElement(
                     "div",

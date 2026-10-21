@@ -34,7 +34,7 @@ npm publish --access public
   "name": "dsh-chatbot-bridge",
   "description": "一站式聊天机器人桥接器：面板管理、任务派发、双通道审批",
   "author": "你的名字",
-  "repository": "https://github.com/USERNAME/dsh-chatbot-bridge",
+  "repository": "https://github.com/lawMo1927/dsh-chatbot-bridge",
   "npm": "dsh-chatbot-bridge",
   "tags": ["chatbot", "bridge", "qq", "astrbot"]
 }

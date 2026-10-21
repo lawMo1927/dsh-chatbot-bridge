@@ -765,8 +765,63 @@ export function apply(ctx, pluginConfig) {
                     astrbot: await isPortOpen(6185),
                     napcat: await isPortOpen(6099),
                     bridge: true,
+                    adminQQ: config.adminQQ || '',
                     qq
                 });
+            }
+
+            if (req.method === 'GET' && url.pathname === '/admin/settings') {
+                return sendJson(res, 200, {
+                    adminQQ: config.adminQQ || '',
+                    workspace: config.workspace,
+                    provider: config.provider,
+                    model: config.model
+                });
+            }
+
+            if (req.method === 'POST' && url.pathname === '/admin/settings') {
+                try {
+                    const body = JSON.parse(await readBody(req));
+                    if (typeof body.adminQQ === 'string') {
+                        config.adminQQ = body.adminQQ.trim();
+                        const configFile = path.join(__dirname, 'config.json');
+                        const data = JSON.parse(fs.readFileSync(configFile, 'utf8'));
+                        data.adminQQ = config.adminQQ;
+                        fs.writeFileSync(configFile, JSON.stringify(data, null, 2), 'utf8');
+                        log(`管理员 QQ 已更新: ${config.adminQQ}`);
+                    }
+                    return sendJson(res, 200, { ok: true, adminQQ: config.adminQQ || '' });
+                } catch (error) {
+                    log(`保存设置失败: ${error.message}`);
+                    return sendJson(res, 500, { error: error.message });
+                }
+            }
+
+            if (req.method === 'POST' && url.pathname === '/admin/astrbot/plugin/install') {
+                try {
+                    const sourceDir = path.join(__dirname, 'adapters', 'astrbot');
+                    if (!fs.existsSync(sourceDir)) return sendJson(res, 400, { error: '插件包缺少 adapters/astrbot 目录' });
+                    const targetDir = path.join(config.astrbot.dir, 'data', 'plugins', 'astrbot_plugin_dsh_bridge');
+                    fs.mkdirSync(targetDir, { recursive: true });
+                    for (const file of fs.readdirSync(sourceDir)) {
+                        fs.copyFileSync(path.join(sourceDir, file), path.join(targetDir, file));
+                    }
+                    log(`AstrBot 插件已安装到 ${targetDir}`);
+                    return sendJson(res, 200, { ok: true, target: targetDir, note: '重启聊天机器人后生效' });
+                } catch (error) {
+                    log(`安装 AstrBot 插件失败: ${error.message}`);
+                    return sendJson(res, 500, { error: error.message });
+                }
+            }
+
+            if (req.method === 'GET' && url.pathname === '/admin/persona-template') {
+                try {
+                    const file = path.join(__dirname, 'templates', 'persona-default.md');
+                    if (!fs.existsSync(file)) return sendJson(res, 404, { error: '没有默认模板' });
+                    return sendJson(res, 200, { template: fs.readFileSync(file, 'utf8') });
+                } catch (error) {
+                    return sendJson(res, 500, { error: error.message });
+                }
             }
 
             if (req.method === 'GET' && url.pathname === '/admin/env') {

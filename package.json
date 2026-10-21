@@ -18,9 +18,9 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/USERNAME/dsh-chatbot-bridge.git"
+    "url": "git+https://github.com/lawMo1927/dsh-chatbot-bridge.git"
   },
-  "homepage": "https://github.com/USERNAME/dsh-chatbot-bridge#readme",
+  "homepage": "https://github.com/lawMo1927/dsh-chatbot-bridge#readme",
   "exports": {
     ".": "./index.js",
     "./client": "./client.js",

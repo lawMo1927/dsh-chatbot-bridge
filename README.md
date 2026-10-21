@@ -31,7 +31,7 @@ pnpm add dsh-chatbot-bridge
       name: dsh-chatbot-bridge
 ```
 
-重启 DSH，侧边栏出现「聊天机器人」入口。
+市场或 `dsh plugin add` 安装会读取仓库根的 `cordis.patch.yml` 自动挂载，不需要手工加这一段。重启 DSH，侧边栏出现「聊天机器人」入口。
 
 ### 方式二：本地目录安装
 
@@ -49,7 +49,7 @@ pnpm add dsh-chatbot-bridge
 
 ## 配置
 
-复制 `config.example.json` 为 `config.json`，按注释修改路径与凭据：
+复制 `config.example.json` 为 `config.json`，按注释修改路径与凭据。`config.json` 不进版本库，安装包也不带；从 npm 或市场安装时，配置文件要放在插件安装目录（DSH profile 的 `node_modules/dsh-chatbot-bridge`）下，首次启动 DSH 之前创建好。
 
 | 字段 | 说明 |
 |---|---|
@@ -105,7 +105,7 @@ DSH 的越权操作（工作区外读写、提权命令）会经过审批。本�
 
 插件把任务桥接入口暴露为 HTTP 服务（默认 9412），聊天机器人侧需要一个适配器调用它。目前提供 AstrBot 适配器：
 
-- 适配器代码与部署说明见 `adapters/astrbot`（另一仓库整理中）
+- 适配器代码在仓库 `adapters/astrbot`，面板「安装」页可以一键复制到 AstrBot 插件目录
 - 接口约定：`POST /task` 提交，`GET /reports` 拉取结果，`POST /approval/answer` 应答审批，`POST /progress` 询问进度，`GET /sessions` 列会话
 
 ## 工作区归属

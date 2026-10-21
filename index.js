@@ -566,14 +566,26 @@ export function apply(ctx, pluginConfig) {
 
     async function startAstrBot() {
         if (await isPortOpen(6185)) return { ok: true, already: true };
+        if (!fs.existsSync(config.astrbot.exe)) {
+            return { ok: false, error: `聊天机器人启动程序不存在: ${config.astrbot.exe}` };
+        }
         const logStream = fs.openSync(config.astrbotLogFile, 'a');
-        const child = spawn(config.astrbot.exe, ['run'], {
-            cwd: config.astrbot.dir,
-            detached: true,
-            windowsHide: true,
-            stdio: ['ignore', logStream, logStream]
-        });
+        let child;
+        try {
+            child = spawn(config.astrbot.exe, ['run'], {
+                cwd: config.astrbot.dir,
+                detached: true,
+                windowsHide: true,
+                stdio: ['ignore', logStream, logStream]
+            });
+        } finally {
+            fs.closeSync(logStream);
+        }
         child.unref();
+        child.on('error', (error) => {
+            log(`聊天机器人子进程错误: ${error.message}`);
+            spawnState.astrbot = null;
+        });
         spawnState.astrbot = child;
         child.on('exit', () => {
             spawnState.astrbot = null;
@@ -650,7 +662,7 @@ export function apply(ctx, pluginConfig) {
                 const taskId = manager.currentTaskId;
                 try {
                     await ctx.sessionController.cancel({ sessionId: manager.sessionId });
-                    manager.markFinished({ error: '任务被中断' });
+                    manager.markFinished({ error: '任务被中断', cancelled: true });
                     log(`任务 ${taskId} 已中断`);
                     setImmediate(pumpQueue);
                     return sendJson(res, 200, { ok: true, taskId });
@@ -841,7 +853,9 @@ export function apply(ctx, pluginConfig) {
                     const targetDir = path.join(config.astrbot.dir, 'data', 'plugins', 'astrbot_plugin_dsh_bridge');
                     fs.mkdirSync(targetDir, { recursive: true });
                     for (const file of fs.readdirSync(sourceDir)) {
-                        fs.copyFileSync(path.join(sourceDir, file), path.join(targetDir, file));
+                        const sourceFile = path.join(sourceDir, file);
+                        if (!fs.statSync(sourceFile).isFile()) continue;
+                        fs.copyFileSync(sourceFile, path.join(targetDir, file));
                     }
                     log(`AstrBot 插件已安装到 ${targetDir}`);
                     return sendJson(res, 200, { ok: true, target: targetDir, note: '重启聊天机器人后生效' });
@@ -1133,11 +1147,17 @@ export function apply(ctx, pluginConfig) {
             if (req.method === 'POST' && url.pathname === '/admin/napcat/start') {
                 try {
                     if (await isPortOpen(6099)) return sendJson(res, 200, { ok: true, already: true });
+                    if (!fs.existsSync(config.napcat.launcher)) {
+                        return sendJson(res, 400, { error: `NapCat 启动脚本不存在: ${config.napcat.launcher}` });
+                    }
                     const child = spawn('cmd.exe', ['/c', config.napcat.launcher], {
                         cwd: config.napcat.dir,
                         windowsHide: true,
                         detached: true,
                         stdio: 'ignore'
+                    });
+                    child.on('error', (error) => {
+                        log(`NapCat 子进程错误: ${error.message}`);
                     });
                     child.unref();
                     log(`已启动 NapCat launcher pid=${child.pid}`);

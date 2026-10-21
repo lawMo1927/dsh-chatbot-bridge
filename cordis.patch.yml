@@ -1,0 +1,4 @@
+# dsh-chatbot-bridge bundle patch: mount the bridge plugin.
+- insert:
+    - id: chatbot-bridge
+      name: dsh-chatbot-bridge

@@ -73,12 +73,15 @@ export class TaskManager {
         }
     }
 
-    markFinished({ error } = {}) {
+    markFinished({ error, cancelled = false } = {}) {
         const task = this.currentTaskId ? this.tasks.get(this.currentTaskId) : null;
         this.currentTaskId = null;
         if (!task) return null;
 
-        if (error) {
+        if (cancelled) {
+            task.status = 'cancelled';
+            task.error = error || '任务被中断';
+        } else if (error) {
             task.status = 'failed';
             task.error = error;
         } else {
@@ -87,10 +90,12 @@ export class TaskManager {
         }
         task.finishedAt = new Date().toISOString();
 
-        const text = error
-            ? `任务 ${task.id} 执行失败：${error}`
-            : task.lastMessage;
-        const files = error ? [] : this.collectArtifacts(task.startedAtMs || 0);
+        const text = cancelled
+            ? `任务 ${task.id} 已中断`
+            : error
+                ? `任务 ${task.id} 执行失败：${error}`
+                : task.lastMessage;
+        const files = error || cancelled ? [] : this.collectArtifacts(task.startedAtMs || 0);
         const sessionTitle = this.lastSessionTitle || 'QQ 桥接会话';
         this.pendingReports.set(task.id, { taskId: task.id, umo: task.umo, fileUmo: task.fileUmo, text, files, sessionTitle });
         this.lastAssistantText = '';

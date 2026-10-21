@@ -1,6 +1,8 @@
 import asyncio
+import datetime
 import json
 import os
+import urllib.error
 import urllib.request
 
 from astrbot.api import logger, star
@@ -13,6 +15,10 @@ from astrbot.core.platform.message_type import MessageType
 BRIDGE_URL = "http://127.0.0.1:9412"
 CHUNK_LIMIT = 1500
 MAX_FILE_BYTES = 50 * 1024 * 1024
+SENT_HISTORY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sent_history.json")
+SENT_HISTORY_LIMIT = 30
+SENT_TEXT_LIMIT = 6000
+SENT_FILE_READ_LIMIT = 64 * 1024
 APPROVAL_ALLOW_WORDS = {"允许", "同意", "allow", "yes", "ok", "可以", "好"}
 APPROVAL_DENY_WORDS = {"拒绝", "不同意", "deny", "no", "不行", "不要"}
 
@@ -24,6 +30,8 @@ class Main(star.Star):
         self._pending_approval_id = None
         self._admin_qq = ""
         self._workspace = ""
+        self._sent_history = []
+        self._sent_history_lock = asyncio.Lock()
 
     async def _load_settings(self) -> None:
         try:
@@ -43,8 +51,17 @@ class Main(star.Star):
         if payload is not None:
             data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         request = urllib.request.Request(BRIDGE_URL + path, data=data, headers=headers, method=method)
-        with urllib.request.urlopen(request, timeout=40) as response:
-            return json.loads(response.read().decode("utf-8"))
+        try:
+            with urllib.request.urlopen(request, timeout=40) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as error:
+            try:
+                body = error.read().decode("utf-8")
+                parsed = json.loads(body)
+                message = parsed.get("error") or parsed.get("reason") or body
+            except Exception:
+                message = str(error)
+            raise RuntimeError(message) from error
 
     async def _bridge(self, method: str, path: str, payload: dict | None = None) -> dict:
         return await asyncio.to_thread(self._bridge_sync, method, path, payload)
@@ -111,25 +128,23 @@ class Main(star.Star):
             return f"询问进度失败：{error}"
 
         status = result.get("status")
+        if status == "idle":
+            return result.get("reply") or "现在没有正在执行的任务。"
+        reply = result.get("reply")
         if status == "completed":
-            return result.get("reply") or "任务已完成，结果和文件已自动发送给用户。"
-        if status == "answered":
-            return result.get("reply") or "DSH 没有返回内容。"
-        if status == "timeout":
-            reply = result.get("reply")
-            if reply:
-                return f"DSH 暂时没有回应，最近的输出是：{reply}"
-            return "DSH 暂时没有回应，可能正在执行较长的步骤，稍后再问一次。"
-        return "已把询问发给 DSH。"
+            return reply or "任务已完成，结果和文件已自动发送给用户。"
+        if reply:
+            return f"任务正在执行，最近的输出是：{reply}"
+        return "已把询问发给 DSH，任务正在执行，稍后再问一次。"
 
     def _resolve_workspace_file(self, file_name: str):
         root = os.path.realpath(self._workspace)
         candidate = os.path.realpath(os.path.join(self._workspace, file_name.strip()))
         if candidate != root and not candidate.startswith(root + os.sep):
-            return "只能访问工作区内的文件。"
+            return None, "只能访问工作区内的文件。"
         if not os.path.isfile(candidate):
-            return f"工作区里没有这个文件：{file_name}"
-        return candidate
+            return None, f"工作区里没有这个文件：{file_name}"
+        return candidate, None
 
     @filter.llm_tool(name="send_workspace_file")
     async def send_workspace_file(self, event: AstrMessageEvent, file_name: str) -> str:
@@ -141,9 +156,9 @@ class Main(star.Star):
         """
         if not self._allowed(event):
             return "这个功能仅限管理员使用。"
-        target = self._resolve_workspace_file(file_name)
-        if isinstance(target, str):
-            return target
+        target, error = self._resolve_workspace_file(file_name)
+        if error:
+            return error
         size = os.path.getsize(target)
         if size > MAX_FILE_BYTES:
             return f"文件太大（{size} 字节），超过发送上限。"
@@ -157,22 +172,38 @@ class Main(star.Star):
             return f"发送失败：{error}"
         if not sent:
             return "文件发送失败，平台可能未就绪。"
+        await self._record_sent({
+            "time": self._now(),
+            "taskId": "",
+            "sessionTitle": "",
+            "umo": event.unified_msg_origin,
+            "text": f"（主动发送工作区文件）{os.path.basename(target)}",
+            "files": [{"name": os.path.basename(target), "path": target, "size": size}],
+        })
         return f"已发送 {os.path.basename(target)}（{size} 字节）。"
 
     @filter.llm_tool(name="read_workspace_file")
-    async def read_workspace_file(self, event: AstrMessageEvent, file_name: str) -> str:
-        """读取工作区内文本文件的内容。
-        当用户询问工作区里某个文件写了什么、想看文件内容时调用。
+    async def read_workspace_file(
+        self,
+        event: AstrMessageEvent,
+        file_name: str,
+        start: int = 0,
+        max_chars: int = 2000,
+    ) -> str:
+        """读取工作区内文本文件的内容，支持指定起始位置与返回长度。
+        当用户询问工作区里某个文件写了什么、想看文件内容或只看某一段时调用。
         二进制文件或过大的文件会拒绝。
 
         Args:
             file_name(string): 工作区内的文件名或相对路径，例如 notes.txt
+            start(int): 从第几个字符开始读，默认 0。
+            max_chars(int): 本次最多返回多少个字符，默认 2000，最大 8000。
         """
         if not self._allowed(event):
             return "这个功能仅限管理员使用。"
-        target = self._resolve_workspace_file(file_name)
-        if isinstance(target, str):
-            return target
+        target, error = self._resolve_workspace_file(file_name)
+        if error:
+            return error
         if os.path.getsize(target) > 1024 * 1024:
             return "文件超过 1MB，改用发送文件的方式查看。"
         try:
@@ -182,10 +213,17 @@ class Main(star.Star):
             return f"读取失败：{error}"
         if b"\x00" in raw[:4096]:
             return "这是二进制文件，内容无法直接展示，可以用发送文件的方式获取。"
-        text = raw.decode("utf-8", errors="replace")
-        if len(text) > 8000:
-            text = text[:8000] + "\n……（内容过长已截断）"
-        return text
+        text = raw.decode("utf-8", errors="replace").lstrip("\ufeff")
+        total = len(text)
+        start = max(0, min(int(start or 0), total))
+        max_chars = max(1, min(int(max_chars or 2000), 8000))
+        chunk = text[start:start + max_chars]
+        if start + len(chunk) < total:
+            chunk += (
+                f"\n……（本次返回第 {start + 1} 到 {start + len(chunk)} 个字符，"
+                f"共 {total} 个字符，可用 start={start + len(chunk)} 继续读取）"
+            )
+        return chunk
 
     @filter.llm_tool(name="cancel_dsh_task")
     async def cancel_dsh_task(self, event: AstrMessageEvent) -> str:
@@ -231,6 +269,58 @@ class Main(star.Star):
             "现在请立即向用户回一句简短自然的回执，说明任务已继续，然后停下，不要调用其他工具。"
         )
 
+    @filter.llm_tool(name="read_own_sent_messages")
+    async def read_own_sent_messages(
+        self,
+        event: AstrMessageEvent,
+        index: int = 0,
+        task_id: str = "",
+        keyword: str = "",
+        full: bool = False,
+    ) -> str:
+        """读取机器人自己最近发送给用户的内容，包括从 DSH 转发的任务结果与文件。
+        当用户询问“刚才发的/之前发的结果或文件是什么”“结果有没有发出去”，
+        或者需要确认自己已经推送过的内容时调用；必要时可以强制读取完整内容与文件文本。
+
+        Args:
+            index(int): 读取倒数第几条发送记录，1 表示最近一条，0 表示默认最近一条。
+            task_id(string): 按 DSH 任务编号筛选，例如 task_1792586133760_731。
+            keyword(string): 按文本内容或文件名筛选。
+            full(bool): 是否返回完整文本；为 true 时文本不截断，并尝试读取工作区内文本文件的内容。
+        """
+        if not self._allowed(event):
+            return "这个功能仅限管理员使用。"
+        async with self._sent_history_lock:
+            records = list(self._sent_history)
+        if not records:
+            return "最近没有发送过内容。"
+        selected = []
+        if task_id:
+            selected = [item for item in records if task_id in str(item.get("taskId") or "")]
+        elif keyword:
+            needle = keyword.strip()
+            for item in records:
+                file_names = " ".join(
+                    str(file_item.get("name") or "") for file_item in item.get("files") or []
+                )
+                if needle in str(item.get("text") or "") or needle in file_names:
+                    selected.append(item)
+            selected = selected[-5:]
+        elif index and index > 0:
+            if index <= len(records):
+                selected = [records[-index]]
+        else:
+            selected = [records[-1]]
+        if not selected:
+            return "没有找到匹配的发送记录。"
+        lines = [f"共 {len(records)} 条发送记录，以下为匹配结果："]
+        for item in selected:
+            lines.append(self._format_sent_record(records, item, full))
+        text = "\n\n".join(lines)
+        if len(text) > 12000:
+            text = text[:12000] + "\n……（输出过长已截断）"
+        return text
+
     @filter.on_llm_request()
     async def on_llm_request(self, event: AstrMessageEvent, req: ProviderRequest) -> None:
         if not self._allowed(event):
@@ -242,12 +332,23 @@ class Main(star.Star):
             "2. 不要主动调用 ask_dsh_progress 确认任务状态，除非用户明确询问进度。\n"
             "3. 提交任务后必须向用户回一句简短自然的话，说明任务已转交，并把发给 DSH 的提示词附上。"
             "回执用你自己的话组织，不要用固定模板。\n"
-            "4. DSH 执行任务时遇到越权操作（工作区外读写、需要提权的命令）会自动向管理员发起审批，"
+            "4. 需要在本机执行文件读写、改代码、运行命令、批量处理等实际操作时，必须调用 run_dsh_task "
+            "交给 DSH 执行，不要使用 AstrBot 自带的文件、命令或代码工具；"
+            "本插件提供的 send_workspace_file、read_workspace_file 等工具可以直接使用。"
+            "简单问答、闲聊、知识查询不需要调用。\n"
+            "5. DSH 执行任务时遇到越权操作（工作区外读写、需要提权的命令）会自动向管理员发起审批，"
             "审批结果由管理员在 QQ 里亲自决定。你不应代替它决定，也不需要向用户解释审批细节。\n"
-            f"5. DSH 只给最高管理员（QQ {self._admin_qq}）使用。其他人询问 DSH、要求用 DSH 做事、"
+            f"6. DSH 只给最高管理员（QQ {self._admin_qq}）使用。其他人询问 DSH、要求用 DSH 做事、"
             "或者让你操作电脑、写文件、跑命令时，必须明确拒绝，不要答应，也不要向他们介绍 DSH 的能力。"
             "拒绝时用普通聊天的语气，不要说教，也不要说'可以'或'我交给它弄'。\n"
+            f"7. 用户提到“工作区”“当前目录”或让 DSH 处理某个文件时，默认指 DSH 工作区：{self._workspace}。"
+            "调用 run_dsh_task 时不要把目标目录改写成 AstrBot 自己的平台工作区路径；"
+            "用户没有给绝对路径时，按 DSH 工作区内的相对路径描述任务。\n"
+            "8. 读取 DSH 工作区内的文件必须使用本插件的 read_workspace_file 工具，"
+            "发送 DSH 工作区内的文件必须使用本插件的 send_workspace_file 工具；"
+            "不要使用 astrbot_file_read_tool、astrbot_file_write_tool 等 AstrBot 自带文件工具处理 DSH 工作区。\n"
         )
+        extra += self._recent_sent_note()
         req.system_prompt = (req.system_prompt or "") + extra
 
     @filter.llm_tool(name="list_dsh_sessions")
@@ -308,16 +409,19 @@ class Main(star.Star):
 
     @filter.on_astrbot_loaded()
     async def on_loaded(self) -> None:
+        self._load_sent_history()
         await self._load_settings()
         self._poll_task = asyncio.create_task(self._poll_reports())
         asyncio.create_task(self._poll_approvals())
         logger.info("dsh_bridge 报告轮询已启动")
+        if self._sent_history:
+            logger.info(f"dsh_bridge 已加载 {len(self._sent_history)} 条发送记录")
 
     async def _poll_approvals(self) -> None:
         while True:
             try:
                 data = await self._bridge("GET", "/approvals/pending")
-                approvals = data.get("approvals", [])
+                approvals = data.get("pending", [])
                 if not approvals:
                     self._pending_approval_id = None
                 elif not self._pending_approval_id:
@@ -328,7 +432,7 @@ class Main(star.Star):
                         "DSH 请求提升权限\n"
                         f"工具：{tool}\n"
                         f"原因：{reason}\n\n"
-                        "回复「允许」或「拒绝」，3 分钟内有效，超时自动拒绝。"
+                        "回复「允许」或「拒绝」，超时自动拒绝。"
                     )
                     umo = f"napcat:FriendMessage:{self._admin_qq}"
                     sent = await self._send_chunked(umo, text)
@@ -388,6 +492,14 @@ class Main(star.Star):
                             ok = await self._send_files(file_umo, item.get("files") or [])
                         if ok:
                             acked.append(item["taskId"])
+                            await self._record_sent({
+                                "time": self._now(),
+                                "taskId": item.get("taskId") or "",
+                                "sessionTitle": title,
+                                "umo": umo,
+                                "text": text,
+                                "files": item.get("files") or [],
+                            })
                     if acked:
                         await self._bridge("POST", "/reports/ack", {"taskIds": acked})
                         logger.info(f"dsh_bridge 已推送 {len(acked)} 条结果")
@@ -440,3 +552,116 @@ class Main(star.Star):
         except Exception as error:
             logger.warning(f"dsh_bridge 发送结果失败（保留待重试）: {error}")
             return False
+
+    @staticmethod
+    def _now() -> str:
+        return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    def _load_sent_history(self) -> None:
+        try:
+            with open(SENT_HISTORY_FILE, encoding="utf-8") as handle:
+                data = json.load(handle)
+        except FileNotFoundError:
+            self._sent_history = []
+            return
+        except Exception as error:
+            logger.warning(f"dsh_bridge 读取发送记录失败: {error}")
+            self._sent_history = []
+            return
+        if isinstance(data, list):
+            self._sent_history = [
+                item for item in data if isinstance(item, dict)
+            ][-SENT_HISTORY_LIMIT:]
+        else:
+            self._sent_history = []
+
+    def _save_sent_history(self) -> None:
+        try:
+            temporary = SENT_HISTORY_FILE + ".tmp"
+            with open(temporary, "w", encoding="utf-8") as handle:
+                json.dump(self._sent_history, handle, ensure_ascii=False, indent=1)
+            os.replace(temporary, SENT_HISTORY_FILE)
+        except Exception as error:
+            logger.warning(f"dsh_bridge 保存发送记录失败: {error}")
+
+    async def _record_sent(self, record: dict) -> None:
+        text = str(record.get("text") or "")
+        if len(text) > SENT_TEXT_LIMIT:
+            record["text"] = text[:SENT_TEXT_LIMIT] + "……（已截断）"
+        async with self._sent_history_lock:
+            self._sent_history.append(record)
+            if len(self._sent_history) > SENT_HISTORY_LIMIT:
+                self._sent_history = self._sent_history[-SENT_HISTORY_LIMIT:]
+            self._save_sent_history()
+
+    def _format_sent_record(self, records: list, record: dict, full: bool) -> str:
+        position = records.index(record) if record in records else -1
+        recent_index = len(records) - position if position >= 0 else 0
+        lines = [
+            f"记录：最近第 {recent_index} 条（时间 {record.get('time') or '未知'}）",
+            f"任务：{record.get('taskId') or '（主动发送，无任务编号）'}",
+        ]
+        title = str(record.get("sessionTitle") or "")
+        if title:
+            lines.append(f"来源会话：{title}")
+        body = str(record.get("text") or "")
+        if not full and len(body) > 400:
+            body = body[:400] + "……（完整内容请用 full=true 读取）"
+        lines.append("内容：\n" + body)
+        files = record.get("files") or []
+        if files:
+            file_lines = []
+            for file_item in files:
+                name = str(
+                    file_item.get("name")
+                    or os.path.basename(str(file_item.get("path") or ""))
+                    or "文件"
+                )
+                path = str(file_item.get("path") or "")
+                size = file_item.get("size")
+                file_lines.append(
+                    f"- {name}（{size if size is not None else '?'} 字节，路径：{path}）"
+                )
+                if full and path:
+                    content = self._read_sent_file_content(path)
+                    if content:
+                        file_lines.append("  文件文本内容：\n" + content)
+            lines.append("附带文件：\n" + "\n".join(file_lines))
+        return "\n".join(lines)
+
+    def _read_sent_file_content(self, file_path: str) -> str:
+        try:
+            if not self._within_workspace(file_path) or not os.path.isfile(file_path):
+                return ""
+            if os.path.getsize(file_path) > SENT_FILE_READ_LIMIT:
+                return "（文件超过 64KB，未自动读取）"
+            with open(file_path, "rb") as handle:
+                raw = handle.read()
+            if b"\x00" in raw[:4096]:
+                return "（二进制文件，未自动读取）"
+            text = raw.decode("utf-8", errors="replace")
+            if len(text) > 4000:
+                text = text[:4000] + "\n……（文件内容已截断）"
+            return text
+        except Exception as error:
+            return f"（读取文件失败：{error}）"
+
+    def _recent_sent_note(self) -> str:
+        if not self._sent_history:
+            return ""
+        recent = list(self._sent_history)[-3:]
+        lines = []
+        for item in recent:
+            body = str(item.get("text") or "").replace("\n", " ").strip()
+            snippet = body[:60] + ("…" if len(body) > 60 else "")
+            files = item.get("files") or []
+            file_part = f"，附带文件 {len(files)} 个" if files else ""
+            lines.append(
+                f"- {item.get('time') or '未知时间'} "
+                f"{item.get('taskId') or '主动发送'}{file_part}：{snippet}"
+            )
+        return (
+            "最近已向用户推送过的内容（这些内容不在当前对话上下文里，"
+            "如果用户询问已经发送的结果或文件，调用 read_own_sent_messages 读取，"
+            "不要回答“结果没有推回来”）：\n" + "\n".join(lines) + "\n"
+        )

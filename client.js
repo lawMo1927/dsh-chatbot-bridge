@@ -181,14 +181,20 @@ window.__ModuleLoader__.load({
                 try {
                     await api("/admin/astrbot/start", { method: "POST" });
                     const deadline = Date.now() + 90000;
+                    let started = false;
                     while (Date.now() < deadline) {
                         await new Promise((resolve) => setTimeout(resolve, 2000));
                         const data = await api("/admin/status");
                         if (data.astrbot) {
+                            started = true;
                             setMessage("聊天机器人已启动");
                             await refresh();
                             break;
                         }
+                    }
+                    if (!started) {
+                        setMessage("启动超时：90 秒内端口 6185 未监听，请查看日志或检查启动程序路径");
+                        await refresh();
                     }
                 } catch (err) {
                     setMessage("启动失败：" + String(err));

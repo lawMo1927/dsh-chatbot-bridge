@@ -1,0 +1,117 @@
+# dsh-chatbot-bridge
+
+DSH 插件：一站式聊天机器人桥接器。装在 DSH 里，侧边栏多一个「聊天机器人」入口，从启动进程、配置模型、编辑人格到扫码登录，全部在面板里完成。机器人派发任务给 DSH 执行，结果与产物文件自动回传聊天。
+
+## 功能
+
+- **一站式面板**：进程管理、安装向导、人格编辑、模型与 API 配置、运行日志
+- **任务桥接**：聊天消息派发给 DSH 执行，结果原文回传，产物文件自动发送
+- **进度插话**：任务执行中追问进度，直接插入任务上下文
+- **中断与继续**：随时中断任务，之后继续
+- **审批双通道**：DSH 的越权审批可以同时在聊天和 DSH 页面应答，任一渠道先到先得
+- **会话可见**：机器人会话出现在 DSH 会话列表里，可查看、可干预
+- **工作区归属**：机器人会话自动归入对应工作区，不落到「未分组」
+- **环境检测与安装**：uv、AstrBot、NapCat、QQ 的检测，缺失组件可一键安装
+
+## 安装
+
+### 方式一：从 npm 安装
+
+在 DSH profile 目录执行：
+
+```bash
+pnpm add dsh-chatbot-bridge
+```
+
+然后在 profile 的 `cordis.patch.yml` 加入：
+
+```yaml
+- insert:
+    - id: chatbot-bridge
+      name: dsh-chatbot-bridge
+```
+
+重启 DSH，侧边栏出现「聊天机器人」入口。
+
+### 方式二：本地目录安装
+
+把本仓库放到 DSH profile 的 `node_modules` 下，或写成 `file:` 依赖：
+
+```json
+{
+  "dependencies": {
+    "dsh-chatbot-bridge": "file:D:/path/to/dsh-chatbot-bridge"
+  }
+}
+```
+
+再执行 `pnpm install` 并添加上面的 patch 行。
+
+## 配置
+
+复制 `config.example.json` 为 `config.json`，按注释修改路径与凭据：
+
+| 字段 | 说明 |
+|---|---|
+| `port` | 桥接服务端口，默认 9412，聊天插件通过它调用桥接 |
+| `workspace` | 机器人执行任务的工作目录，也是会话的 cwd |
+| `dshHome` | DSH 数据目录，默认 `C:\Users\<名字>\.dsh` |
+| `astrbot` | AstrBot 的安装目录、启动 exe、WebUI 地址与登录凭据 |
+| `napcat` | NapCat 的 WebUI 地址、token、安装目录与启动脚本 |
+| `pythonExe` `qrScript` | 二维码图片生成所需的 Python 与脚本 |
+| `qqPath` | QQ 客户端路径，用于检测是否已安装 |
+
+## 面板
+
+侧边栏「聊天机器人」入口包含五个分页：
+
+| 分页 | 内容 |
+|---|---|
+| 进程 | 聊天机器人启停重启、NapCat 启动、QQ 登录状态与二维码、桥接状态 |
+| 安装 | 环境检测、缺失组件的安装按钮、最近安装输出 |
+| 人格 | 人格列表、系统提示词全文编辑与保存 |
+| 模型与 API | 当前模型选择（按供应商分组）、降级列表、供应商配置与添加 |
+| 日志 | 最近 200 行运行日志 |
+
+## 审批
+
+DSH 的越权操作（工作区外读写、提权命令）会经过审批。本插件把审批请求同时推给聊天和 DSH 页面：
+
+- DSH 页面开着：页面弹窗与聊天通知同时出现，任一渠道应答都有效
+- DSH 页面没开：审批直接落到聊天，管理员回复允许或拒绝
+
+若希望聊天优先、页面弹窗不再出现，可以应用 `docs/PATCHES.md` 里的可选补丁。
+
+## 聊天机器人接入
+
+插件把任务桥接入口暴露为 HTTP 服务（默认 9412），聊天机器人侧需要一个适配器调用它。目前提供 AstrBot 适配器：
+
+- 适配器代码与部署说明见 `adapters/astrbot`（另一仓库整理中）
+- 接口约定：`POST /task` 提交，`GET /reports` 拉取结果，`POST /approval/answer` 应答审批，`POST /progress` 询问进度，`GET /sessions` 列会话
+
+## 工作区归属
+
+插件创建或恢复会话后，自动把会话归入 cwd 匹配的工作区。历史会话可用 `POST /admin/sessions/attach` 补登记。
+
+## 常见问题
+
+**QQ 二维码获取失败**：先确认 NapCat 在运行（6099 端口），且 `config.json` 里的 token 正确。
+
+**审批没有出现在聊天里**：检查 DSH 页面是否打开着且正在等待页面应答；或应用可选补丁。
+
+**AstrBot 启动后自动退出**：早期版本存在此问题，已改为独立进程并写日志到 `astrbotLogFile`。
+
+## 开发
+
+```bash
+# 语法检查
+node --check index.js
+node --check client.js
+
+# 安装到本机 DSH 调试
+# 把仓库目录复制到 profile 的 node_modules，重启 DSH 查看插件日志
+```
+
+## 许可
+
+MIT

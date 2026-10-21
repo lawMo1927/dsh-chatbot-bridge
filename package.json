@@ -1,0 +1,47 @@
+{
+  "name": "dsh-chatbot-bridge",
+  "version": "0.1.0",
+  "description": "DSH 插件：一站式聊天机器人桥接器。在 DSH 侧边栏管理聊天机器人进程、派发任务、双通道审批，让机器人真正会干活。",
+  "type": "module",
+  "main": "index.js",
+  "license": "MIT",
+  "keywords": [
+    "deepseek",
+    "harness",
+    "dsh",
+    "dsh-plugin",
+    "chatbot",
+    "bridge",
+    "qq",
+    "astrbot",
+    "napcat"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/USERNAME/dsh-chatbot-bridge.git"
+  },
+  "homepage": "https://github.com/USERNAME/dsh-chatbot-bridge#readme",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-slots",
+        "@deepseek-ai/dsh-client-locale"
+      ],
+      "platform": "web"
+    }
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "tasks.js",
+    "config.example.json",
+    "README.md",
+    "docs",
+    "LICENSE"
+  ]
+}

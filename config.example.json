@@ -1,0 +1,31 @@
+{
+  "port": 9412,
+  "workspace": "D:\\path\\to\\your\\bot-workspace",
+  "dshHome": "C:\\Users\\YOURNAME\\.dsh",
+  "provider": "deepseek-official",
+  "model": "deepseek-flash",
+  "stateFile": "D:\\path\\to\\your\\dsh-chatbot-bridge\\state.json",
+  "logFile": "D:\\path\\to\\your\\dsh-chatbot-bridge\\bridge.log",
+  "astrbotLogFile": "D:\\path\\to\\your\\dsh-chatbot-bridge\\astrbot.log",
+  "installDir": "D:\\path\\to\\your\\dsh-chatbot-bridge\\downloads",
+  "taskTimeoutMinutes": 60,
+  "approvalTimeoutSeconds": 300,
+  "pythonExe": "C:\\Users\\YOURNAME\\AppData\\Local\\Python\\pythoncore-3.14-64\\python.exe",
+  "qrScript": "D:\\path\\to\\your\\tools\\gen-qrcode.py",
+  "qrImageFile": "D:\\path\\to\\your\\dsh-chatbot-bridge\\qrcode.png",
+  "qqPath": "C:\\Program Files\\Tencent\\QQNT\\QQ.exe",
+  "astrbot": {
+    "dir": "D:\\path\\to\\astrbot",
+    "exe": "D:\\path\\to\\astrbot\\uv\\tools\\astrbot\\Scripts\\astrbot.exe",
+    "webui": "http://127.0.0.1:6185",
+    "username": "your-astrbot-username",
+    "password": "your-astrbot-password"
+  },
+  "napcat": {
+    "webui": "http://127.0.0.1:6099",
+    "token": "your-napcat-token",
+    "dir": "D:\\path\\to\\napcat",
+    "launcher": "D:\\path\\to\\napcat\\launcher.bat",
+    "downloadUrl": "https://github.com/NapNeko/NapCatQQ/releases/latest/download/NapCat.Shell.zip"
+  }
+}

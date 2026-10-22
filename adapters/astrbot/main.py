@@ -38,7 +38,8 @@ APPROVAL_OUTCOME_LABELS = {
 }
 PROMPT_MODES = ("auto", "queue", "steer")
 STEER_PUSH_PREFIX = "DSH 对追加指令的回复："
-STEER_TASK_TTL_SECONDS = 1800
+TASK_PUSH_PREFIX = "DSH 回复："
+STEER_TASK_TTL_SECONDS = 6 * 3600
 EVENT_POLL_INTERVAL_SECONDS = 2
 APPROVAL_ID_PATTERN = re.compile(r"approval[_-][\w.-]+")
 APPROVAL_ALLOW_PATTERN = re.compile(
@@ -346,16 +347,20 @@ class Main(star.Star):
             return f"桥接服务返回的内容缺少任务编号，无法确认提交结果：{result}"
         target_session = result.get("sessionId") or session_id or "桥接会话"
         mode_used = result.get("mode") or mode
-        if mode_used == "steer":
-            self._steer_tasks.setdefault(
-                str(task_id),
-                {
-                    "umo": event.unified_msg_origin,
-                    "pushed": False,
-                    "text": "",
-                    "createdAt": datetime.datetime.now().timestamp(),
-                },
-            )
+        # 所有由适配器提交的任务都登记实时推送目标；普通任务与追加指令都要及时回传
+        self._steer_tasks.setdefault(
+            str(task_id),
+            {
+                "umo": event.unified_msg_origin,
+                "mode": mode_used,
+                "pushed": False,
+                "text": "",
+                "pushed_texts": [],
+                "pushed_seqs": [],
+                "createdAt": datetime.datetime.now().timestamp(),
+                "lastEventAt": datetime.datetime.now().timestamp(),
+            },
+        )
         # 回执由适配器生成，包含完整提示词，作为单条消息直接展示
         if mode_used == "steer":
             receipt = (
@@ -659,6 +664,19 @@ class Main(star.Star):
             return f"桥接服务返回的内容缺少任务编号，无法确认提交结果：{result}"
         session_id = result.get("sessionId")
         suffix = f"，会话 {session_id}" if session_id else ""
+        self._steer_tasks.setdefault(
+            str(new_task_id),
+            {
+                "umo": event.unified_msg_origin,
+                "mode": "continue",
+                "pushed": False,
+                "text": "",
+                "pushed_texts": [],
+                "pushed_seqs": [],
+                "createdAt": datetime.datetime.now().timestamp(),
+                "lastEventAt": datetime.datetime.now().timestamp(),
+            },
+        )
         receipt = f"已提交继续指令（新任务编号 {new_task_id}{suffix}），我发出的提示词是：\n\n{payload['prompt']}"
         event.set_extra("dsh_receipt_text", receipt)
         event.set_extra("dsh_single_message", True)
@@ -1410,13 +1428,15 @@ class Main(star.Star):
                         task_id = str(item.get("taskId") or "")
                         steer_state = self._steer_tasks.get(task_id)
                         raw_text = str(item.get("text") or "")
-                        pushed_text = str(steer_state.get("text") or "") if steer_state else ""
-                        # 只跳过与实时推送完全相同的文本；最终答复不同时仍要发送
+                        pushed_texts = [
+                            str(value).strip()
+                            for value in (steer_state or {}).get("pushed_texts", [])
+                            if str(value).strip()
+                        ]
+                        # 只跳过已经实时推送过的相同文本；最终答复不同时仍要发送
                         skip_text = bool(
-                            steer_state
-                            and steer_state.get("pushed")
-                            and pushed_text.strip()
-                            and raw_text.strip() == pushed_text.strip()
+                            raw_text.strip()
+                            and raw_text.strip() in pushed_texts
                         )
                         files = item.get("files") or []
                         umo = item.get("umo") or f"napcat:FriendMessage:{self._admin_qq}"
@@ -1427,7 +1447,7 @@ class Main(star.Star):
                             text = f"（转发自DSH会话：{title}）\n\n{text}"
                         ok = True
                         if skip_text:
-                            logger.info(f"dsh_bridge steer 回复已实时推送，跳过报告文本：{task_id}")
+                            logger.info(f"dsh_bridge DSH 回复已实时推送，跳过报告文本：{task_id}")
                         else:
                             ok = await self._send_chunked(umo, text)
                         if ok:
@@ -1527,7 +1547,10 @@ class Main(star.Star):
         if not task_id:
             return
         state = self._steer_tasks.get(task_id)
-        if state is None or state.get("pushed"):
+        if state is None:
+            return
+        seq = item.get("seq")
+        if isinstance(seq, int) and seq in state.get("pushed_seqs", []):
             return
         data = item.get("data")
         text = str(data.get("text") or "").strip() if isinstance(data, dict) else ""
@@ -1538,12 +1561,27 @@ class Main(star.Star):
         if not umo:
             self._steer_tasks.pop(task_id, None)
             return
-        message = f"{STEER_PUSH_PREFIX}\n{text}"
+        prefix = (
+            STEER_PUSH_PREFIX
+            if str(state.get("mode") or "") == "steer"
+            else TASK_PUSH_PREFIX
+        )
+        message = f"{prefix}\n{text}"
         if not await self._send_chunked(umo, message):
-            logger.warning(f"dsh_bridge steer 回复实时推送失败，等待最终报告：{task_id}")
+            logger.warning(f"dsh_bridge DSH 回复实时推送失败，等待最终报告：{task_id}")
             return
         state["pushed"] = True
         state["text"] = text
+        state["lastEventAt"] = datetime.datetime.now().timestamp()
+        pushed_texts = state.setdefault("pushed_texts", [])
+        pushed_texts.append(text)
+        if len(pushed_texts) > 50:
+            del pushed_texts[:-50]
+        pushed_seqs = state.setdefault("pushed_seqs", [])
+        if isinstance(seq, int):
+            pushed_seqs.append(seq)
+            if len(pushed_seqs) > 100:
+                del pushed_seqs[:-100]
         await self._record_sent({
             "time": self._now(),
             "taskId": task_id,
@@ -1552,7 +1590,7 @@ class Main(star.Star):
             "text": message,
             "files": [],
         })
-        logger.info(f"dsh_bridge 已实时推送 steer 回复：{task_id}")
+        logger.info(f"dsh_bridge 已实时推送 DSH 回复：{task_id}")
 
     @staticmethod
     def _clean_live_text(text: str) -> str:
@@ -1568,12 +1606,12 @@ class Main(star.Star):
         now = datetime.datetime.now().timestamp()
         for task_id in list(self._steer_tasks):
             state = self._steer_tasks.get(task_id) or {}
-            created_at = state.get("createdAt")
-            if not isinstance(created_at, (int, float)):
-                created_at = now
-            if now - float(created_at) > STEER_TASK_TTL_SECONDS:
+            last_event_at = state.get("lastEventAt") or state.get("createdAt")
+            if not isinstance(last_event_at, (int, float)):
+                last_event_at = now
+            if now - float(last_event_at) > STEER_TASK_TTL_SECONDS:
                 self._steer_tasks.pop(task_id, None)
-                logger.info(f"dsh_bridge 已清理过期的 steer 缓存：{task_id}")
+                logger.info(f"dsh_bridge 已清理过期的实时推送缓存：{task_id}")
 
     def _within_workspace(self, file_path: str) -> bool:
         try:

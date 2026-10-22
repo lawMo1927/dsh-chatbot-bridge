@@ -2,6 +2,7 @@ import asyncio
 import datetime
 import json
 import os
+import re
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -35,6 +36,22 @@ APPROVAL_OUTCOME_LABELS = {
     "timeout": "超时自动拒绝",
 }
 PROMPT_MODES = ("auto", "queue", "steer")
+STEER_PUSH_PREFIX = "DSH 对追加指令的回复："
+STEER_TASK_TTL_SECONDS = 1800
+EVENT_POLL_INTERVAL_SECONDS = 2
+APPROVAL_ID_PATTERN = re.compile(r"approval[_-][\w.-]+")
+APPROVAL_ALLOW_PATTERN = re.compile(
+    r"^(?P<word>"
+    + "|".join(re.escape(word) for word in sorted(APPROVAL_ALLOW_WORDS, key=len, reverse=True))
+    + r")(?P<rest>.*)$",
+    re.IGNORECASE,
+)
+APPROVAL_DENY_PATTERN = re.compile(
+    r"^(?P<word>"
+    + "|".join(re.escape(word) for word in sorted(APPROVAL_DENY_WORDS, key=len, reverse=True))
+    + r")(?P<rest>.*)$",
+    re.IGNORECASE,
+)
 
 
 class BridgeError(RuntimeError):
@@ -48,10 +65,14 @@ class Main(star.Star):
         self.context = context
         self._poll_task = None
         self._pending_approval_id = None
+        self._pending_approvals = []
         self._admin_qq = ""
         self._workspace = ""
         self._sent_history = []
         self._sent_history_lock = asyncio.Lock()
+        self._event_cursor = 0
+        self._event_poll_count = 0
+        self._steer_tasks = {}
 
     async def _load_settings(self) -> None:
         try:
@@ -323,8 +344,19 @@ class Main(star.Star):
         if not task_id:
             return f"桥接服务返回的内容缺少任务编号，无法确认提交结果：{result}"
         target_session = result.get("sessionId") or session_id or "桥接会话"
+        mode_used = result.get("mode") or mode
+        if mode_used == "steer":
+            self._steer_tasks.setdefault(
+                str(task_id),
+                {
+                    "umo": event.unified_msg_origin,
+                    "pushed": False,
+                    "text": "",
+                    "createdAt": datetime.datetime.now().timestamp(),
+                },
+            )
         # 回执由适配器生成，包含完整提示词，作为单条消息直接展示
-        if (result.get("mode") or mode) == "steer":
+        if mode_used == "steer":
             receipt = (
                 f"已向正在执行的任务追加指令（任务编号 {task_id}，会话 {target_session}），"
                 f"追加的提示词是：\n\n{prompt.strip()}"
@@ -336,7 +368,7 @@ class Main(star.Star):
             )
         event.set_extra("dsh_receipt_text", receipt)
         event.set_extra("dsh_single_message", True)
-        if (result.get("mode") or mode) == "steer":
+        if mode_used == "steer":
             return (
                 f"已向正在执行的任务追加指令（任务编号 {task_id}，会话 {target_session}）。"
                 "回执已由插件生成并发送，你不需要再重复提示词。"
@@ -641,7 +673,9 @@ class Main(star.Star):
         待审批项包含工具、命令、原因、所属会话与任务、已等待时间；
         最近已结束的审批包含工具、命令、原因、会话、任务、发起时间、结束时间与结果。
         当用户询问是否在等审批、审批要批什么、任务为什么停住，或想确认刚才的审批结果时调用。
-        本工具只能查询；审批决定必须由管理员本人在 QQ 里回复，不要代替管理员批准或拒绝。
+        管理员在 QQ 里可以回复「允许 审批编号」或「拒绝 审批编号」精确处理某一项，
+        只回复「允许」或「拒绝」时处理当前推送的那一项。
+        本工具只能查询；审批决定必须由管理员本人作出，不要代替管理员批准或拒绝。
 
         Args:
             action(string): 目前只支持 list。
@@ -677,7 +711,8 @@ class Main(star.Star):
         else:
             lines.append("最近没有已结束的审批记录。")
         lines.append(
-            "审批决定由管理员在 QQ 里回复「允许」或「拒绝」作出，"
+            "审批决定由管理员在 QQ 里回复「允许 审批编号」或「拒绝 审批编号」作出，"
+            "也可以只回复「允许」或「拒绝」处理当前推送项；"
             "你只负责查询，不要代替管理员决定，也不要声称已经批准或拒绝。"
         )
         return "\n".join(lines)
@@ -697,7 +732,8 @@ class Main(star.Star):
         else:
             lines.append("当前没有待审批项。")
         lines.append(
-            "审批决定由管理员在 QQ 里回复「允许」或「拒绝」作出，"
+            "审批决定由管理员在 QQ 里回复「允许 审批编号」或「拒绝 审批编号」作出，"
+            "也可以只回复「允许」或「拒绝」处理当前推送项；"
             "你只负责查询，不要代替管理员决定，也不要声称已经批准或拒绝。"
         )
         return "\n".join(lines)
@@ -1011,7 +1047,8 @@ class Main(star.Star):
             "astrbot_file_write_tool 等 AstrBot 自带文件工具处理 DSH 工作区。\n"
             "7. DSH 执行任务时遇到越权操作（工作区外读写、需要提权的命令）会自动向管理员发起审批。"
             "用 dsh_approval 可以查询待审批项的工具、命令、原因与所属会话，也可以查看最近已结束审批的时间与结果；"
-            "审批决定必须由管理员在 QQ 里亲自回复，模型不得代替管理员批准或拒绝，"
+            "待审批项有多条时推送文案会带审批编号与序号，管理员可以回复「允许 审批编号」或「拒绝 审批编号」"
+            "精确处理某一项；审批决定必须由管理员本人作出，模型不得代替管理员批准或拒绝，"
             "也不要根据最近的审批结果推断下一次审批会被允许。\n"
             "8. 需要查看会话双方历史消息、DSH 之前的输出，或判断某个会话最近在做什么时，"
             "用 dsh_session 的 history 或 status 动作读取，不要凭记忆回答。\n"
@@ -1031,7 +1068,8 @@ class Main(star.Star):
         await self._load_settings()
         self._poll_task = asyncio.create_task(self._poll_reports())
         asyncio.create_task(self._poll_approvals())
-        logger.info("dsh_bridge 报告轮询已启动")
+        asyncio.create_task(self._poll_events())
+        logger.info("dsh_bridge 报告、审批与事件轮询已启动")
         if self._sent_history:
             logger.info(f"dsh_bridge 已加载 {len(self._sent_history)} 条发送记录")
 
@@ -1039,29 +1077,55 @@ class Main(star.Star):
         while True:
             try:
                 data = await self._bridge("GET", "/approvals/pending")
-                approvals = data.get("pending", [])
+                approvals = data.get("pending") or []
+                self._pending_approvals = approvals
                 if not approvals:
                     self._pending_approval_id = None
-                elif not self._pending_approval_id:
-                    item = approvals[0]
-                    tool = item.get("toolName") or "未知工具"
-                    reason = item.get("reason") or "（无说明）"
-                    text = (
-                        "DSH 请求提升权限\n"
-                        f"工具：{tool}\n"
-                        f"原因：{reason}\n\n"
-                        "回复「允许」或「拒绝」，超时自动拒绝。"
+                else:
+                    current_id = self._pending_approval_id or ""
+                    current = next(
+                        (item for item in approvals if str(item.get("id") or "") == current_id),
+                        None,
                     )
-                    umo = f"napcat:FriendMessage:{self._admin_qq}"
-                    sent = await self._send_chunked(umo, text)
-                    if sent:
-                        self._pending_approval_id = item["id"]
-                        logger.info(f"dsh_bridge 已推送审批请求 {item['id']}")
-                    else:
-                        logger.warning("dsh_bridge 审批请求发送失败，稍后重试")
+                    if current is None:
+                        item = approvals[0]
+                        text = self._format_approval_notice(item, 1, len(approvals))
+                        umo = f"napcat:FriendMessage:{self._admin_qq}"
+                        sent = await self._send_chunked(umo, text)
+                        if sent:
+                            self._pending_approval_id = str(item.get("id") or "")
+                            logger.info(
+                                f"dsh_bridge 已推送审批请求 {self._pending_approval_id}"
+                                f"（共 {len(approvals)} 项待审批）"
+                            )
+                        else:
+                            logger.warning("dsh_bridge 审批请求发送失败，稍后重试")
             except Exception as error:
                 logger.warning(f"dsh_bridge 拉取审批请求失败: {error}")
             await asyncio.sleep(2)
+
+    def _format_approval_notice(self, item: dict, index: int, total: int) -> str:
+        approval_id = str(item.get("id") or "")
+        tool = item.get("toolName") or "未知工具"
+        reason = item.get("reason") or "（无说明）"
+        lines = [
+            f"DSH 请求提升权限（第 {index} 项，共 {total} 项待审批）",
+            f"审批编号：{approval_id}",
+            f"工具：{tool}",
+            f"原因：{reason}",
+        ]
+        if item.get("sessionId"):
+            lines.append(f"会话：{item.get('sessionId')}")
+        if item.get("taskId"):
+            lines.append(f"任务：{item.get('taskId')}")
+        lines.append("")
+        lines.append(f"回复「允许 {approval_id}」或「拒绝 {approval_id}」处理这一项；")
+        if total > 1:
+            lines.append("也可以只回复「允许」或「拒绝」处理当前这一项。")
+        else:
+            lines.append("也可以只回复「允许」或「拒绝」。")
+        lines.append("超时自动拒绝。")
+        return "\n".join(lines)
 
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def on_approval_reply(self, event: AstrMessageEvent) -> None:
@@ -1070,26 +1134,96 @@ class Main(star.Star):
         if event.get_message_type() != MessageType.FRIEND_MESSAGE:
             return
         text = (event.message_str or "").strip()
-        if not text or len(text) > 10:
+        if not text or len(text) > 80:
             return
-        is_allow = text in APPROVAL_ALLOW_WORDS
-        is_deny = text in APPROVAL_DENY_WORDS
-        if not is_allow and not is_deny:
+        decision, approval_id = self._parse_approval_reply(text)
+        if decision is None:
             return
-        approval_id = self._pending_approval_id
-        if not approval_id:
-            return
+        pending = list(self._pending_approvals)
+        if approval_id:
+            target = next(
+                (
+                    item
+                    for item in pending
+                    if str(item.get("id") or "").lower() == approval_id.lower()
+                ),
+                None,
+            )
+            if target is None:
+                try:
+                    data = await self._bridge("GET", "/approvals/pending")
+                    self._pending_approvals = data.get("pending") or []
+                    pending = list(self._pending_approvals)
+                except Exception as error:
+                    logger.warning(f"dsh_bridge 刷新待审批列表失败: {error}")
+                target = next(
+                    (
+                        item
+                        for item in pending
+                        if str(item.get("id") or "").lower() == approval_id.lower()
+                    ),
+                    None,
+                )
+            if target is None:
+                event.stop_event()
+                known = "、".join(str(item.get("id") or "未知编号") for item in pending) or "无"
+                await self.context.send_message(
+                    event.unified_msg_origin,
+                    MessageChain([
+                        Plain(
+                            f"没有找到待审批编号 {approval_id}。"
+                            f"当前待审批项：{known}。请核对编号后重新回复。"
+                        )
+                    ]),
+                )
+                logger.info(f"dsh_bridge 审批编号不存在，未提交：{approval_id}")
+                return
+            approval_id = str(target.get("id") or "")
+        else:
+            approval_id = self._pending_approval_id or ""
+            if not approval_id:
+                return
         event.stop_event()
-        decision = "allow" if is_allow else "reject"
+        decision_value = "allow" if decision == "allow" else "reject"
         try:
-            await self._bridge("POST", "/approval/answer", {"id": approval_id, "decision": decision})
-            self._pending_approval_id = None
-            label = "允许" if is_allow else "拒绝"
-            await self.context.send_message(event.unified_msg_origin, MessageChain([Plain(f"审批已提交：{label}")]))
-            logger.info(f"dsh_bridge 审批 {approval_id} 已提交: {decision}")
+            await self._bridge("POST", "/approval/answer", {"id": approval_id, "decision": decision_value})
+            if self._pending_approval_id == approval_id:
+                self._pending_approval_id = None
+            self._pending_approvals = [
+                item for item in self._pending_approvals
+                if str(item.get("id") or "") != approval_id
+            ]
+            label = "允许" if decision == "allow" else "拒绝"
+            await self.context.send_message(
+                event.unified_msg_origin,
+                MessageChain([Plain(f"审批已提交：{label}（{approval_id}）")]),
+            )
+            logger.info(f"dsh_bridge 审批 {approval_id} 已提交: {decision_value}")
         except Exception as error:
             logger.warning(f"dsh_bridge 提交审批失败: {error}")
-            await self.context.send_message(event.unified_msg_origin, MessageChain([Plain(f"审批提交失败：{error}")]))
+            await self.context.send_message(
+                event.unified_msg_origin,
+                MessageChain([Plain(f"审批提交失败：{error}")]),
+            )
+
+    @staticmethod
+    def _parse_approval_reply(text: str):
+        for pattern, decision in (
+            (APPROVAL_ALLOW_PATTERN, "allow"),
+            (APPROVAL_DENY_PATTERN, "reject"),
+        ):
+            match = pattern.match(text)
+            if not match:
+                continue
+            rest = match.group("rest").strip()
+            while rest[:1] in (":", "：", " ", "\t"):
+                rest = rest[1:].strip()
+            if not rest:
+                return decision, ""
+            if APPROVAL_ID_PATTERN.fullmatch(rest):
+                return decision, rest
+            return None, ""
+        return None, ""
 
     async def _poll_reports(self) -> None:
         while True:
@@ -1099,31 +1233,154 @@ class Main(star.Star):
                 if reports:
                     acked = []
                     for item in reports:
+                        task_id = str(item.get("taskId") or "")
+                        steer_state = self._steer_tasks.get(task_id)
+                        skip_text = bool(steer_state and steer_state.get("pushed"))
+                        files = item.get("files") or []
                         umo = item.get("umo") or f"napcat:FriendMessage:{self._admin_qq}"
                         file_umo = item.get("fileUmo") or umo
                         title = str(item.get("sessionTitle") or "")
                         text = item.get("text") or ""
                         if title:
                             text = f"（转发自DSH会话：{title}）\n\n{text}"
-                        ok = await self._send_chunked(umo, text)
+                        ok = True
+                        if skip_text:
+                            logger.info(f"dsh_bridge steer 回复已实时推送，跳过报告文本：{task_id}")
+                        else:
+                            ok = await self._send_chunked(umo, text)
                         if ok:
-                            ok = await self._send_files(file_umo, item.get("files") or [])
+                            ok = await self._send_files(file_umo, files)
                         if ok:
                             acked.append(item["taskId"])
-                            await self._record_sent({
-                                "time": self._now(),
-                                "taskId": item.get("taskId") or "",
-                                "sessionTitle": title,
-                                "umo": umo,
-                                "text": text,
-                                "files": item.get("files") or [],
-                            })
+                            if skip_text:
+                                if files:
+                                    await self._record_sent({
+                                        "time": self._now(),
+                                        "taskId": task_id,
+                                        "sessionTitle": title,
+                                        "umo": umo,
+                                        "text": "",
+                                        "files": files,
+                                    })
+                            else:
+                                await self._record_sent({
+                                    "time": self._now(),
+                                    "taskId": item.get("taskId") or "",
+                                    "sessionTitle": title,
+                                    "umo": umo,
+                                    "text": text,
+                                    "files": files,
+                                })
+                            self._steer_tasks.pop(task_id, None)
                     if acked:
                         await self._bridge("POST", "/reports/ack", {"taskIds": acked})
                         logger.info(f"dsh_bridge 已推送 {len(acked)} 条结果")
             except Exception as error:
                 logger.warning(f"dsh_bridge 拉取报告失败: {error}")
             await asyncio.sleep(3)
+
+    async def _poll_events(self) -> None:
+        while True:
+            try:
+                await self._poll_events_once()
+                self._expire_steer_tasks()
+            except BridgeError as error:
+                if error.status == 404:
+                    logger.warning(
+                        "dsh_bridge 桥接版本较旧，未提供 /events 接口，"
+                        "实时 steer 推送不可用；最终报告仍会正常发送"
+                    )
+                    return
+                logger.warning(f"dsh_bridge 拉取会话事件失败，重新获取游标: {error}")
+                self._event_cursor = 0
+            except Exception as error:
+                logger.warning(f"dsh_bridge 拉取会话事件失败，重新获取游标: {error}")
+                self._event_cursor = 0
+            await asyncio.sleep(EVENT_POLL_INTERVAL_SECONDS)
+
+    async def _poll_events_once(self) -> None:
+        self._event_poll_count += 1
+        if self._event_cursor > 0 and self._event_poll_count % 30 == 0:
+            await self._resync_event_cursor()
+        if self._event_cursor <= 0:
+            data = await self._bridge("GET", "/events")
+            self._event_cursor = self._event_cursor_of(data)
+            logger.info(f"dsh_bridge 事件轮询从序号 {self._event_cursor} 开始，跳过早先事件")
+            return
+        data = await self._bridge("GET", f"/events?sinceSeq={self._event_cursor}")
+        for item in data.get("events") or []:
+            seq = item.get("seq")
+            if not isinstance(seq, int) or seq <= self._event_cursor:
+                continue
+            self._event_cursor = seq
+            await self._handle_live_event(item)
+        cursor = data.get("cursor")
+        if isinstance(cursor, int) and cursor > self._event_cursor:
+            self._event_cursor = cursor
+
+    async def _resync_event_cursor(self) -> None:
+        data = await self._bridge("GET", "/events")
+        latest = self._event_cursor_of(data)
+        if latest < self._event_cursor:
+            logger.warning(
+                f"dsh_bridge 检测到事件序号回退（{self._event_cursor} -> {latest}），"
+                "桥接可能已重启，重新获取游标"
+            )
+            self._event_cursor = latest
+
+    @staticmethod
+    def _event_cursor_of(data: dict) -> int:
+        cursor = data.get("cursor")
+        best = cursor if isinstance(cursor, int) else 0
+        for item in data.get("events") or []:
+            seq = item.get("seq")
+            if isinstance(seq, int) and seq > best:
+                best = seq
+        return best
+
+    async def _handle_live_event(self, item: dict) -> None:
+        if item.get("type") != "assistant/message":
+            return
+        task_id = self._event_task_id(item)
+        if not task_id:
+            return
+        state = self._steer_tasks.get(task_id)
+        if state is None or state.get("pushed"):
+            return
+        data = item.get("data")
+        text = str(data.get("text") or "").strip() if isinstance(data, dict) else ""
+        if not text:
+            return
+        umo = str(state.get("umo") or "")
+        if not umo:
+            self._steer_tasks.pop(task_id, None)
+            return
+        message = f"{STEER_PUSH_PREFIX}\n{text}"
+        if not await self._send_chunked(umo, message):
+            logger.warning(f"dsh_bridge steer 回复实时推送失败，等待最终报告：{task_id}")
+            return
+        state["pushed"] = True
+        state["text"] = text
+        await self._record_sent({
+            "time": self._now(),
+            "taskId": task_id,
+            "sessionTitle": "",
+            "umo": umo,
+            "text": message,
+            "files": [],
+        })
+        logger.info(f"dsh_bridge 已实时推送 steer 回复：{task_id}")
+
+    def _expire_steer_tasks(self) -> None:
+        now = datetime.datetime.now().timestamp()
+        for task_id in list(self._steer_tasks):
+            state = self._steer_tasks.get(task_id) or {}
+            created_at = state.get("createdAt")
+            if not isinstance(created_at, (int, float)):
+                created_at = now
+            if now - float(created_at) > STEER_TASK_TTL_SECONDS:
+                self._steer_tasks.pop(task_id, None)
+                logger.info(f"dsh_bridge 已清理过期的 steer 缓存：{task_id}")
 
     def _within_workspace(self, file_path: str) -> bool:
         try:

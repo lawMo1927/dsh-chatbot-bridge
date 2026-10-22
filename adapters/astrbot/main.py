@@ -3,6 +3,7 @@ import datetime
 import json
 import os
 import urllib.error
+import urllib.parse
 import urllib.request
 
 from astrbot.api import logger, star
@@ -21,6 +22,13 @@ SENT_TEXT_LIMIT = 6000
 SENT_FILE_READ_LIMIT = 64 * 1024
 APPROVAL_ALLOW_WORDS = {"允许", "同意", "allow", "yes", "ok", "可以", "好"}
 APPROVAL_DENY_WORDS = {"拒绝", "不同意", "deny", "no", "不行", "不要"}
+PROMPT_MODES = ("auto", "queue", "steer")
+
+
+class BridgeError(RuntimeError):
+    def __init__(self, message: str, status: int = 0) -> None:
+        super().__init__(message)
+        self.status = status
 
 
 class Main(star.Star):
@@ -50,7 +58,27 @@ class Main(star.Star):
         headers = {"Content-Type": "application/json"}
         if payload is not None:
             data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        request = urllib.request.Request(BRIDGE_URL + path, data=data, headers=headers, method=method)
+
+        def send() -> dict:
+            request = urllib.request.Request(BRIDGE_URL + path, data=data, headers=headers, method=method)
+            return self._send_request(request)
+
+        try:
+            return send()
+        except (ConnectionResetError, ConnectionAbortedError) as error:
+            if method != "GET":
+                raise BridgeError(
+                    f"与桥接服务的连接被中断，可能该接口尚未实现或桥接服务正在重启：{error}"
+                ) from error
+            try:
+                return send()
+            except (ConnectionResetError, ConnectionAbortedError) as retry_error:
+                raise BridgeError(
+                    f"与桥接服务的连接被中断，可能该接口尚未实现或桥接服务正在重启：{retry_error}"
+                ) from retry_error
+
+    @staticmethod
+    def _send_request(request: urllib.request.Request) -> dict:
         try:
             with urllib.request.urlopen(request, timeout=40) as response:
                 return json.loads(response.read().decode("utf-8"))
@@ -61,7 +89,9 @@ class Main(star.Star):
                 message = parsed.get("error") or parsed.get("reason") or body
             except Exception:
                 message = str(error)
-            raise RuntimeError(message) from error
+            raise BridgeError(str(message), error.code) from error
+        except urllib.error.URLError as error:
+            raise BridgeError(f"无法连接桥接服务 {BRIDGE_URL}：{error.reason}") from error
 
     async def _bridge(self, method: str, path: str, payload: dict | None = None) -> dict:
         return await asyncio.to_thread(self._bridge_sync, method, path, payload)
@@ -81,61 +111,618 @@ class Main(star.Star):
             return f"{platform_name}:FriendMessage:{self._admin_qq}"
         return umo
 
-    @filter.llm_tool(name="run_dsh_task")
-    async def run_dsh_task(self, event: AstrMessageEvent, prompt: str) -> str:
-        """把需要在本机执行的任务交给 DSH 处理，例如写入或修改文件、改代码、执行命令、批量处理文档。
-        当用户要求做实际的电脑操作、普通聊天无法完成时调用。
-        简单的问答、闲聊、知识查询不要调用本工具。
-        任务结果和产物文件会由桥接层自动发送给用户，提交后只需简短回执，不要调用 send_message_to_user 发送结果或文件。
+    @filter.llm_tool(name="dsh_session")
+    async def dsh_session(
+        self,
+        event: AstrMessageEvent,
+        action: str,
+        session_id: str = "",
+        limit: int = 20,
+        before_seq: int = 0,
+        prompt: str = "",
+        mode: str = "auto",
+    ) -> str:
+        """查询 DSH 会话列表、会话状态或双方历史消息，也可以向指定会话发送提示词。
+        action 取值：
+        - list：列出所有会话的运行状态、当前任务、是否等待审批。
+        - status：查看指定会话的详细状态，需要 session_id。
+        - history：读取指定会话的历史消息，需要 session_id，可用 before_seq 向前翻页。
+        - prompt：向指定会话发送提示词；不传 session_id 时发给机器人自己的桥接会话。
+        不确定会话编号时先用 list 查询，不要猜测。
 
         Args:
-            prompt(string): 完整自包含的任务描述，包含目标、输入和期望的输出位置。
+            action(string): list、status、history、prompt 之一。
+            session_id(string): 会话编号，来自 list 的结果；prompt 动作可以留空表示桥接会话。
+            limit(int): list 与 history 最多返回多少条，默认 20，最大 100。
+            before_seq(int): history 向前翻页的起始序号，取上一次结果里的提示，默认 0 表示从最新读起。
+            prompt(string): action 为 prompt 时要发送的提示词。
+            mode(string): action 为 prompt 时的提交方式，auto（默认）、queue 或 steer。
         """
         if not self._allowed(event):
             return "这个功能仅限管理员使用。"
+        action = (action or "").strip().lower()
+        session_id = (session_id or "").strip()
+        if action == "list":
+            return await self._session_list(limit)
+        if action == "status":
+            return await self._session_status(session_id)
+        if action == "history":
+            return await self._session_history(session_id, limit, before_seq)
+        if action == "prompt":
+            if not (prompt or "").strip():
+                return "action 为 prompt 时需要提供 prompt。"
+            if mode not in PROMPT_MODES:
+                return "mode 只能是 auto、queue 或 steer。"
+            return await self._submit_prompt(event, session_id, prompt, mode)
+        return "action 只能是 list、status、history、prompt。"
+
+    async def _session_list(self, limit: int) -> str:
         try:
-            result = await self._bridge("POST", "/task", {
-                "prompt": prompt,
-                "umo": self._report_umo(event),
-                "fileUmo": event.unified_msg_origin if event.get_message_type() == MessageType.GROUP_MESSAGE else "",
-            })
+            data = await self._bridge("GET", "/sessions")
         except Exception as error:
-            logger.error(f"dsh_bridge 提交任务失败: {error}")
-            return f"提交给 DSH 失败：{error}"
+            logger.error(f"dsh_bridge 获取会话列表失败: {error}")
+            return self._bridge_error_text("读取会话列表（GET /sessions）", error)
+        sessions = data.get("sessions") or []
+        if not sessions:
+            return "当前没有任何 DSH 会话。"
+        limit = max(1, min(int(limit or 20), 100))
+        shown = sessions[:limit]
+        lines = [f"共 {len(sessions)} 个会话（按最近活动排序，显示前 {len(shown)} 个）："]
+        lines.extend(self._format_session_line(item) for item in shown)
+        if len(sessions) > len(shown):
+            lines.append(f"还有 {len(sessions) - len(shown)} 个会话未显示，可以调大 limit。")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _session_flags(item: dict) -> str:
+        tags = []
+        if item.get("running"):
+            tags.append("运行中")
+        if item.get("waitingApproval"):
+            tags.append("等待审批")
+        if item.get("archived"):
+            tags.append("已归档")
+        if item.get("pinned"):
+            tags.append("置顶")
+        if item.get("blank"):
+            tags.append("空白")
+        return "、".join(tags) if tags else "空闲"
+
+    def _format_session_line(self, item: dict) -> str:
+        line = (
+            f"- {item.get('sessionId') or '（缺少编号）'}"
+            f"｜{self._session_flags(item)}"
+            f"｜{item.get('title') or '（无标题）'}"
+        )
+        cwd = item.get("cwd")
+        if cwd:
+            line += f"｜{cwd}"
+        current_task_id = item.get("currentTaskId")
+        if current_task_id:
+            line += f"｜当前任务 {current_task_id}"
+        task_ids = item.get("taskIds") or []
+        if task_ids:
+            line += f"｜任务 {len(task_ids)} 个"
+        updated_at = item.get("updatedAt")
+        if updated_at:
+            line += f"｜最近活动 {self._format_time(updated_at)}"
+        return line
+
+    async def _session_status(self, session_id: str) -> str:
+        if not session_id:
+            return "查看会话状态需要 session_id；请先用 dsh_session 的 list 动作查询会话编号。"
+        try:
+            data = await self._bridge("GET", "/sessions")
+        except Exception as error:
+            logger.error(f"dsh_bridge 获取会话列表失败: {error}")
+            return self._bridge_error_text("读取会话列表（GET /sessions）", error)
+        sessions = data.get("sessions") or []
+        item = next(
+            (candidate for candidate in sessions if str(candidate.get("sessionId") or "") == session_id),
+            None,
+        )
+        if item is None:
+            return f"没有找到会话 {session_id}；请先用 dsh_session 的 list 动作查询会话编号。"
+        lines = [
+            f"会话 {session_id}：",
+            f"标题：{item.get('title') or '（无标题）'}",
+            f"状态：{self._session_flags(item)}",
+            f"工作目录：{item.get('cwd') or '（未知）'}",
+            f"当前任务：{item.get('currentTaskId') or '无'}",
+        ]
+        updated_at = item.get("updatedAt")
+        if updated_at:
+            lines.append(f"最近活动：{self._format_time(updated_at)}")
+        tasks, task_error = await self._fetch_tasks(session_id, "", 10)
+        if task_error:
+            lines.append(task_error)
+        elif tasks:
+            lines.append("该会话最近的任务：")
+            lines.extend(self._format_task_line(task) for task in tasks)
+        else:
+            lines.append("该会话还没有任务记录。")
+        return "\n".join(lines)
+
+    async def _session_history(self, session_id: str, limit: int, before_seq: int) -> str:
+        if not session_id:
+            return "读取历史需要 session_id；请先用 dsh_session 的 list 动作查询会话编号。"
+        query = {"limit": str(max(1, min(int(limit or 20), 100)))}
+        if int(before_seq or 0) > 0:
+            query["beforeSeq"] = str(int(before_seq))
+        path = (
+            f"/sessions/{urllib.parse.quote(session_id, safe='')}/history"
+            f"?{urllib.parse.urlencode(query)}"
+        )
+        try:
+            data = await self._bridge("GET", path)
+        except Exception as error:
+            logger.error(f"dsh_bridge 读取会话历史失败: {error}")
+            return self._bridge_error_text("读取会话历史（GET /sessions/:id/history）", error)
+        messages = data.get("messages") or []
+        if not messages:
+            return f"会话 {session_id} 没有可读取的历史消息。"
+        ordered = sorted(messages, key=self._message_seq)
+        lines = [f"会话 {session_id} 的历史消息（本次返回 {len(ordered)} 条）："]
+        for item in ordered:
+            text = str(item.get("text") or "").strip()
+            if len(text) > 600:
+                text = text[:600] + "……"
+            lines.append(
+                f"[{self._format_time(item.get('time'))}] #{item.get('seq')}"
+                f" {item.get('role') or '?'}/{item.get('source') or '?'}/{item.get('kind') or '?'}：{text}"
+            )
+        if data.get("hasMore"):
+            oldest_seq = ordered[0].get("seq")
+            lines.append(f"还有更早的消息；把 before_seq 设为 {oldest_seq} 可以继续向前翻页。")
+        else:
+            lines.append("已经读到最早的消息。")
+        text = "\n".join(lines)
+        if len(text) > 12000:
+            text = text[:12000] + "\n……（输出过长已截断）"
+        return text
+
+    @staticmethod
+    def _message_seq(item: dict):
+        seq = item.get("seq")
+        return seq if isinstance(seq, (int, float)) else 0
+
+    async def _submit_prompt(
+        self,
+        event: AstrMessageEvent,
+        session_id: str,
+        prompt: str,
+        mode: str,
+    ) -> str:
+        payload = {
+            "target": {"sessionId": session_id} if session_id else {},
+            "prompt": prompt.strip(),
+            "mode": mode,
+            "umo": self._report_umo(event),
+            "fileUmo": event.unified_msg_origin if event.get_message_type() == MessageType.GROUP_MESSAGE else "",
+        }
+        try:
+            result = await self._bridge("POST", "/prompt", payload)
+        except Exception as error:
+            logger.error(f"dsh_bridge 提交提示词失败: {error}")
+            return self._bridge_error_text("提交提示词（POST /prompt）", error)
+        if result.get("accepted") is False:
+            return f"DSH 没有接受这次提交：{result.get('error') or '桥接未给出原因'}"
+        task_id = result.get("taskId")
+        if not task_id:
+            return f"桥接服务返回的内容缺少任务编号，无法确认提交结果：{result}"
+        target_session = result.get("sessionId") or session_id or "桥接会话"
+        if (result.get("mode") or mode) == "steer":
+            return (
+                f"已向正在执行的任务追加指令（任务编号 {task_id}，会话 {target_session}）。"
+                "追加内容会由 DSH 在当前回合一并处理，最终结果和产物文件会由桥接层自动发送给用户。"
+                "现在请立即向用户输出一句简短自然的回执，然后把追加的提示词原样附上"
+                "（可以用代码块或引号）。回执发完后停下，不要调用其他工具，也不要查进度。"
+            )
         return (
-            f"任务已提交给 DSH（编号 {result['taskId']}）。"
-            "现在请立即向用户输出一句简短自然的回执，说明任务已转交，并把发给 DSH 的提示词原样附上"
+            f"已把提示词提交给 DSH（任务编号 {task_id}，会话 {target_session}）。"
+            "任务结果和产物文件会由桥接层自动发送给用户。"
+            "现在请立即向用户输出一句简短自然的回执，说明已转交，并把发给 DSH 的提示词原样附上"
             "（可以用代码块或引号）。回执发完后停下，不要调用其他工具，也不要查进度。"
         )
 
-    @filter.llm_tool(name="ask_dsh_progress")
-    async def ask_dsh_progress(self, event: AstrMessageEvent, question: str) -> str:
-        """向 DSH 询问当前任务的执行进度。
-        仅在用户主动询问进度、卡在哪、还要多久、做完了没有时调用。
-        不要用它来确认任务是否完成，任务完成后桥接层会自动推送结果。
+    @filter.llm_tool(name="dsh_task")
+    async def dsh_task(
+        self,
+        event: AstrMessageEvent,
+        action: str,
+        task_id: str = "",
+        session_id: str = "",
+        prompt: str = "",
+        status: str = "",
+        limit: int = 20,
+    ) -> str:
+        """查询或操作 DSH 任务。
+        action 取值：
+        - run：把任务交给 DSH 执行，需要 prompt；可用 session_id 指定目标会话，不传时用机器人自己的桥接会话。
+        目标会话正在执行时，这次提示词会作为追加指令处理；需要明确指定提交方式时用 dsh_session 的 prompt 动作。
+        - list：列出任务，可用 session_id、status、limit 过滤。
+        - status：查看指定任务的详情，需要 task_id。
+        - progress：查看指定任务当前阶段与最近事件，需要 task_id。
+        - cancel：中断指定任务，需要 task_id。
+        - continue：以指定任务为上下文继续，需要 task_id，prompt 为补充说明。
+        涉及具体任务时必须用 task_id 精确指定；不知道编号时先用 list 查询，不要猜测。
+        任务结果和产物文件由桥接层自动发送给用户。
 
         Args:
-            question(string): 具体要问的问题，例如“现在进度如何”。
+            action(string): run、list、status、progress、cancel、continue 之一。
+            task_id(string): 任务编号，例如 task_1792586133760_731。
+            session_id(string): 会话编号，用于 run 指定目标会话，或用于 list 按会话过滤。
+            prompt(string): run 的任务描述，或 continue 的补充说明；run 时必须提供。
+            status(string): list 过滤的任务状态，例如 running、completed、failed、cancelled。
+            limit(int): list 最多返回多少条任务，默认 20，最大 100。
         """
         if not self._allowed(event):
             return "这个功能仅限管理员使用。"
-        try:
-            result = await self._bridge("POST", "/progress", {
-                "question": question or "请简要汇报当前进度，一句话即可。",
-            })
-        except Exception as error:
-            logger.error(f"dsh_bridge 询问进度失败: {error}")
-            return f"询问进度失败：{error}"
+        action = (action or "").strip().lower()
+        task_id = (task_id or "").strip()
+        session_id = (session_id or "").strip()
+        if action == "run":
+            if not (prompt or "").strip():
+                return "action 为 run 时需要提供 prompt。"
+            return await self._submit_prompt(event, session_id, prompt, "auto")
+        if action == "list":
+            return await self._task_list(session_id, (status or "").strip(), limit)
+        if action == "status":
+            return await self._task_status(task_id)
+        if action == "progress":
+            return await self._task_progress(task_id)
+        if action == "cancel":
+            return await self._task_cancel(task_id)
+        if action == "continue":
+            return await self._task_continue(event, task_id, prompt)
+        return "action 只能是 run、list、status、progress、cancel、continue。"
 
-        status = result.get("status")
-        if status == "idle":
-            return result.get("reply") or "现在没有正在执行的任务。"
-        reply = result.get("reply")
-        if status == "completed":
-            return reply or "任务已完成，结果和文件已自动发送给用户。"
-        if reply:
-            return f"任务正在执行，最近的输出是：{reply}"
-        return "已把询问发给 DSH，任务正在执行，稍后再问一次。"
+    async def _fetch_tasks(self, session_id: str, status: str, limit: int):
+        query = {"limit": str(max(1, min(int(limit or 20), 100)))}
+        if session_id:
+            query["sessionId"] = session_id
+        if status:
+            query["status"] = status
+        path = "/tasks?" + urllib.parse.urlencode(query)
+        try:
+            data = await self._bridge("GET", path)
+        except Exception as error:
+            logger.error(f"dsh_bridge 获取任务列表失败: {error}")
+            return None, self._bridge_error_text("读取任务列表（GET /tasks）", error)
+        return data.get("tasks") or [], None
+
+    async def _task_list(self, session_id: str, status: str, limit: int) -> str:
+        tasks, error_text = await self._fetch_tasks(session_id, status, limit)
+        if error_text:
+            return error_text
+        if not tasks:
+            conditions = []
+            if session_id:
+                conditions.append(f"会话 {session_id}")
+            if status:
+                conditions.append(f"状态 {status}")
+            scope = "、".join(conditions)
+            if scope:
+                return f"没有找到符合条件（{scope}）的任务。"
+            return "当前没有任何任务记录。"
+        heading = f"共 {len(tasks)} 个任务"
+        if session_id:
+            heading += f"（会话 {session_id}）"
+        lines = [heading + "："]
+        lines.extend(self._format_task_line(item) for item in tasks)
+        return "\n".join(lines)
+
+    def _format_task_line(self, item: dict) -> str:
+        line = f"- {item.get('taskId') or '（缺少编号）'}｜{item.get('status') or '未知状态'}"
+        session_id = item.get("sessionId")
+        if session_id:
+            line += f"｜会话 {session_id}"
+        prompt = str(item.get("prompt") or "").replace("\n", " ").strip()
+        if prompt:
+            line += f"｜{self._truncate_text(prompt, 80)}"
+        phase = item.get("phase")
+        if phase:
+            line += f"｜{phase}"
+        created_at = item.get("createdAt")
+        if created_at:
+            line += f"｜创建 {self._format_time(created_at)}"
+        if item.get("durationMs") is not None:
+            line += f"｜耗时 {self._format_duration(item.get('durationMs'))}"
+        return line
+
+    @staticmethod
+    def _session_block(task: dict) -> dict:
+        block = task.get("session")
+        return block if isinstance(block, dict) else {}
+
+    def _format_task_detail(self, task: dict) -> str:
+        session_block = self._session_block(task)
+        lines = [f"任务 {task.get('taskId') or '（缺少编号）'}："]
+        lines.append(f"状态：{task.get('status') or '未知状态'}")
+        session_id = task.get("sessionId") or session_block.get("sessionId")
+        if session_id:
+            lines.append(f"会话：{session_id}")
+        session_title = task.get("sessionTitle") or session_block.get("title")
+        if session_title:
+            lines.append(f"会话标题：{session_title}")
+        session_status = task.get("sessionStatus") or session_block.get("status")
+        if session_status:
+            lines.append(f"会话状态：{session_status}")
+        prompt = str(task.get("prompt") or "").strip()
+        if prompt:
+            lines.append("提示词：\n" + self._truncate_text(prompt, 2000))
+        created_at = task.get("createdAt")
+        if created_at:
+            lines.append(f"创建时间：{self._format_time(created_at)}")
+        started_at = task.get("startedAt")
+        if started_at:
+            lines.append(f"开始时间：{self._format_time(started_at)}")
+        finished_at = task.get("finishedAt")
+        if finished_at:
+            lines.append(f"结束时间：{self._format_time(finished_at)}")
+        if task.get("durationMs") is not None:
+            lines.append(f"耗时：{self._format_duration(task.get('durationMs'))}")
+        last_message = task.get("lastMessage")
+        if last_message:
+            lines.append("最近输出：\n" + self._truncate_text(str(last_message), 3000))
+        error = task.get("error")
+        if error:
+            lines.append(f"错误：{error}")
+        return "\n".join(lines)
+
+    async def _task_status(self, task_id: str) -> str:
+        if not task_id:
+            return "查看任务详情需要 task_id；请先用 dsh_task 的 list 动作查询任务编号。"
+        try:
+            task = await self._bridge("GET", f"/tasks/{urllib.parse.quote(task_id, safe='')}")
+        except Exception as error:
+            logger.error(f"dsh_bridge 获取任务详情失败: {error}")
+            return self._bridge_error_text("读取任务详情（GET /tasks/:id）", error)
+        return self._format_task_detail(task)
+
+    async def _task_progress(self, task_id: str) -> str:
+        if not task_id:
+            return "查询进度需要 task_id；请先用 dsh_task 的 list 动作查询任务编号。"
+        try:
+            task = await self._bridge("GET", f"/tasks/{urllib.parse.quote(task_id, safe='')}")
+        except Exception as error:
+            logger.error(f"dsh_bridge 获取任务进度失败: {error}")
+            return self._bridge_error_text("读取任务详情（GET /tasks/:id）", error)
+        status = task.get("status") or "未知状态"
+        session_block = self._session_block(task)
+        lines = [f"任务 {task_id} 进度：", f"状态：{status}"]
+        session_id = task.get("sessionId") or session_block.get("sessionId")
+        if session_id:
+            lines.append(f"会话：{session_id}")
+        session_title = task.get("sessionTitle") or session_block.get("title")
+        if session_title:
+            lines.append(f"会话标题：{session_title}")
+        phase = task.get("phase")
+        if phase:
+            lines.append(f"当前阶段：{phase}")
+        percent = task.get("progressPercent", task.get("percent", task.get("progress")))
+        if isinstance(percent, (int, float)):
+            lines.append(f"大致进度：{percent}%")
+        elif isinstance(percent, str) and percent.strip():
+            lines.append(f"大致进度：{percent}")
+        if status == "running":
+            elapsed = self._elapsed_ms(task.get("startedAt"))
+            if elapsed is not None:
+                lines.append(f"已运行：{self._format_duration(elapsed)}")
+        if task.get("durationMs") is not None:
+            lines.append(f"总耗时：{self._format_duration(task.get('durationMs'))}")
+        last_message = task.get("lastMessage")
+        if last_message:
+            lines.append("最近输出：\n" + self._truncate_text(str(last_message), 2000))
+        error = task.get("error")
+        if error:
+            lines.append(f"错误：{error}")
+        if session_id:
+            lines.append(await self._task_events(session_id, task_id))
+        else:
+            lines.append("任务详情没有 sessionId，无法核对最近事件的归属，因此不展示事件。")
+        return "\n".join(lines)
+
+    async def _task_events(self, session_id: str, task_id: str) -> str:
+        path = "/events?" + urllib.parse.urlencode({"sessionId": session_id})
+        try:
+            data = await self._bridge("GET", path)
+        except Exception as error:
+            logger.warning(f"dsh_bridge 读取事件失败: {error}")
+            return self._bridge_error_text("读取事件（GET /events）", error)
+        events = data.get("events") or []
+        matched = [item for item in events if self._event_task_id(item) == task_id]
+        if not matched:
+            if any(self._event_task_id(item) for item in events):
+                return "最近事件：没有找到属于该任务的事件。"
+            if events:
+                return "最近事件：桥接返回的事件都没有标注任务的编号，无法确认是否属于当前任务，因此不展示。"
+            return "最近事件：暂无。"
+        lines = ["最近事件："]
+        for item in matched[-5:]:
+            lines.append(f"- {self._format_event(item)}")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _event_task_id(item: dict) -> str:
+        task_id = item.get("taskId")
+        if task_id:
+            return str(task_id)
+        data = item.get("data")
+        if isinstance(data, dict) and data.get("taskId"):
+            return str(data["taskId"])
+        return ""
+
+    def _format_event(self, item: dict) -> str:
+        event_type = item.get("type") or "未知事件"
+        data = item.get("data")
+        pieces = []
+        if isinstance(data, dict):
+            text = data.get("text")
+            if text:
+                pieces.append(self._truncate_text(str(text).replace("\n", " ").strip(), 200))
+            for key in ("phase", "status", "reason", "title"):
+                value = data.get(key)
+                if value is not None and value != "":
+                    pieces.append(f"{key}={value}")
+        suffix = "；".join(piece for piece in pieces if piece)
+        return f"[{self._format_time(item.get('time'))}] {event_type}" + (f"：{suffix}" if suffix else "")
+
+    async def _task_cancel(self, task_id: str) -> str:
+        if not task_id:
+            return "中断任务需要 task_id；请先用 dsh_task 的 list 动作查询任务编号。"
+        try:
+            result = await self._bridge("POST", f"/tasks/{urllib.parse.quote(task_id, safe='')}/cancel", {})
+        except Exception as error:
+            logger.error(f"dsh_bridge 中断任务失败: {error}")
+            return self._bridge_error_text("中断任务（POST /tasks/:id/cancel）", error)
+        if result.get("ok"):
+            return f"已请求中断任务 {task_id}。中断生效后桥接层会推送结果，你可以告诉用户任务已停止。"
+        return f"中断任务失败：{result.get('error') or result.get('reason') or '桥接未给出原因'}"
+
+    async def _task_continue(self, event: AstrMessageEvent, task_id: str, prompt: str) -> str:
+        if not task_id:
+            return "继续任务需要 task_id；请先用 dsh_task 的 list 动作查询任务编号。"
+        note = (prompt or "").strip()
+        payload = {
+            "prompt": note or "请继续完成刚才中断的任务，从上次中断的位置接着做，完成后汇报结果。",
+            "umo": self._report_umo(event),
+            "fileUmo": event.unified_msg_origin if event.get_message_type() == MessageType.GROUP_MESSAGE else "",
+        }
+        try:
+            result = await self._bridge(
+                "POST",
+                f"/tasks/{urllib.parse.quote(task_id, safe='')}/continue",
+                payload,
+            )
+        except Exception as error:
+            logger.error(f"dsh_bridge 继续任务失败: {error}")
+            return self._bridge_error_text("继续任务（POST /tasks/:id/continue）", error)
+        new_task_id = result.get("taskId")
+        if not new_task_id:
+            return f"桥接服务返回的内容缺少任务编号，无法确认提交结果：{result}"
+        session_id = result.get("sessionId")
+        suffix = f"，会话 {session_id}" if session_id else ""
+        return (
+            f"已提交继续指令（新任务编号 {new_task_id}{suffix}）。"
+            "现在请立即向用户回一句简短自然的回执，说明任务已继续，然后停下，不要调用其他工具。"
+        )
+
+    @filter.llm_tool(name="dsh_approval")
+    async def dsh_approval(self, event: AstrMessageEvent, action: str = "list") -> str:
+        """查询 DSH 的待审批项，包括工具、命令、原因、所属会话与任务、已等待时间。
+        当用户询问是否在等审批、审批要批什么、任务为什么停住时调用。
+        本工具只能查询；审批决定必须由管理员本人在 QQ 里回复，不要代替管理员批准或拒绝。
+
+        Args:
+            action(string): 目前只支持 list。
+        """
+        if not self._allowed(event):
+            return "这个功能仅限管理员使用。"
+        if (action or "").strip().lower() != "list":
+            return "action 目前只支持 list。"
+        try:
+            data = await self._bridge("GET", "/approvals/pending")
+        except Exception as error:
+            logger.error(f"dsh_bridge 获取待审批项失败: {error}")
+            return self._bridge_error_text("读取待审批项（GET /approvals/pending）", error)
+        approvals = data.get("pending") or []
+        if not approvals:
+            return "当前没有待审批项。"
+        lines = [f"当前有 {len(approvals)} 项待审批："]
+        for item in approvals:
+            lines.append(self._format_approval(item))
+        lines.append(
+            "审批决定由管理员在 QQ 里回复「允许」或「拒绝」作出，"
+            "你只负责查询，不要代替管理员决定，也不要声称已经批准。"
+        )
+        return "\n".join(lines)
+
+    def _format_approval(self, item: dict) -> str:
+        lines = [f"- 审批编号 {item.get('id') or '未知'}｜工具 {item.get('toolName') or '未知工具'}"]
+        if item.get("sessionId"):
+            lines.append(f"  会话：{item.get('sessionId')}")
+        if item.get("taskId"):
+            lines.append(f"  任务：{item.get('taskId')}")
+        command = str(item.get("command") or "").strip()
+        if command:
+            lines.append("  命令：" + self._truncate_text(command, 1500).replace("\n", "\n    "))
+        reason = str(item.get("reason") or "").strip()
+        if reason:
+            lines.append(f"  原因：{reason}")
+        created_at = item.get("createdAt")
+        if created_at:
+            lines.append(f"  发起时间：{self._format_time(created_at)}")
+            elapsed = self._elapsed_ms(created_at)
+            if elapsed is not None:
+                lines.append(f"  已等待：{self._format_duration(elapsed)}")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _format_time(value) -> str:
+        if value is None or value == "":
+            return "未知时间"
+        if isinstance(value, (int, float)):
+            seconds = float(value)
+            if seconds > 1e12:
+                seconds /= 1000.0
+            try:
+                moment = datetime.datetime.fromtimestamp(seconds)
+            except (OverflowError, OSError, ValueError):
+                return str(value)
+            return moment.strftime("%Y-%m-%d %H:%M:%S")
+        return str(value)
+
+    @staticmethod
+    def _format_duration(milliseconds) -> str:
+        try:
+            total_seconds = int(float(milliseconds) / 1000.0)
+        except (TypeError, ValueError):
+            return "未知"
+        if total_seconds < 0:
+            return "未知"
+        days, remainder = divmod(total_seconds, 86400)
+        hours, remainder = divmod(remainder, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        parts = []
+        if days:
+            parts.append(f"{days} 天")
+        if hours:
+            parts.append(f"{hours} 小时")
+        if minutes:
+            parts.append(f"{minutes} 分")
+        if seconds or not parts:
+            parts.append(f"{seconds} 秒")
+        return " ".join(parts)
+
+    @staticmethod
+    def _elapsed_ms(started_at):
+        if started_at is None or started_at == "":
+            return None
+        if isinstance(started_at, (int, float)):
+            seconds = float(started_at)
+            if seconds > 1e12:
+                seconds /= 1000.0
+            start = datetime.datetime.fromtimestamp(seconds)
+        else:
+            try:
+                start = datetime.datetime.fromisoformat(str(started_at).replace("Z", "+00:00"))
+            except ValueError:
+                return None
+        now = datetime.datetime.now(start.tzinfo) if start.tzinfo is not None else datetime.datetime.now()
+        return max(0, int((now - start).total_seconds() * 1000))
+
+    @staticmethod
+    def _truncate_text(text: str, limit: int) -> str:
+        if len(text) <= limit:
+            return text
+        return text[:limit] + "……（已截断）"
+
+    @staticmethod
+    def _bridge_error_text(operation: str, error: Exception) -> str:
+        if isinstance(error, BridgeError) and error.status == 404 and str(error) == "未知接口":
+            return f"桥接服务尚未提供{operation}接口，请先更新 DSH 聊天机器人桥接插件后再试。"
+        return f"{operation}失败：{error}"
 
     def _resolve_workspace_file(self, file_name: str):
         root = os.path.realpath(self._workspace)
@@ -146,16 +733,38 @@ class Main(star.Star):
             return None, f"工作区里没有这个文件：{file_name}"
         return candidate, None
 
-    @filter.llm_tool(name="send_workspace_file")
-    async def send_workspace_file(self, event: AstrMessageEvent, file_name: str) -> str:
-        """把工作区里已有的文件直接发给用户。
-        当用户要求发送、给我、发一份工作区内的文件时调用。
+    @filter.llm_tool(name="dsh_file")
+    async def dsh_file(
+        self,
+        event: AstrMessageEvent,
+        action: str,
+        file_name: str,
+        start: int = 0,
+        max_chars: int = 2000,
+    ) -> str:
+        """读取或发送 DSH 工作区内的文件。
+        action 为 send 时把工作区里已有的文件直接发给用户；action 为 read 时读取文本内容，支持分段读取。
+        处理 DSH 工作区文件只用本工具，不要使用 AstrBot 自带的文件工具。
 
         Args:
-            file_name(string): 工作区内的文件名或相对路径，例如 notes.txt
+            action(string): send 或 read。
+            file_name(string): 工作区内的文件名或相对路径，例如 notes.txt。
+            start(int): action 为 read 时从第几个字符开始读，默认 0。
+            max_chars(int): action 为 read 时本次最多返回多少个字符，默认 2000，最大 8000。
         """
         if not self._allowed(event):
             return "这个功能仅限管理员使用。"
+        action = (action or "").strip().lower()
+        file_name = (file_name or "").strip()
+        if not file_name:
+            return "需要提供 file_name，例如 notes.txt。"
+        if action == "send":
+            return await self._send_workspace_file(event, file_name)
+        if action == "read":
+            return await self._read_workspace_file(file_name, start, max_chars)
+        return "action 只能是 send 或 read。"
+
+    async def _send_workspace_file(self, event: AstrMessageEvent, file_name: str) -> str:
         target, error = self._resolve_workspace_file(file_name)
         if error:
             return error
@@ -182,25 +791,7 @@ class Main(star.Star):
         })
         return f"已发送 {os.path.basename(target)}（{size} 字节）。"
 
-    @filter.llm_tool(name="read_workspace_file")
-    async def read_workspace_file(
-        self,
-        event: AstrMessageEvent,
-        file_name: str,
-        start: int = 0,
-        max_chars: int = 2000,
-    ) -> str:
-        """读取工作区内文本文件的内容，支持指定起始位置与返回长度。
-        当用户询问工作区里某个文件写了什么、想看文件内容或只看某一段时调用。
-        二进制文件或过大的文件会拒绝。
-
-        Args:
-            file_name(string): 工作区内的文件名或相对路径，例如 notes.txt
-            start(int): 从第几个字符开始读，默认 0。
-            max_chars(int): 本次最多返回多少个字符，默认 2000，最大 8000。
-        """
-        if not self._allowed(event):
-            return "这个功能仅限管理员使用。"
+    async def _read_workspace_file(self, file_name: str, start: int, max_chars: int) -> str:
         target, error = self._resolve_workspace_file(file_name)
         if error:
             return error
@@ -224,50 +815,6 @@ class Main(star.Star):
                 f"共 {total} 个字符，可用 start={start + len(chunk)} 继续读取）"
             )
         return chunk
-
-    @filter.llm_tool(name="cancel_dsh_task")
-    async def cancel_dsh_task(self, event: AstrMessageEvent) -> str:
-        """中断当前正在执行的 DSH 任务。
-        当用户明确要求停止、取消、打断、中断当前任务时调用。
-        普通聊天不要调用。
-        """
-        if not self._allowed(event):
-            return "这个功能仅限管理员使用。"
-        try:
-            result = await self._bridge("POST", "/task/cancel", {})
-        except Exception as error:
-            logger.error(f"dsh_bridge 中断任务失败: {error}")
-            return f"中断任务失败：{error}"
-        if result.get("ok"):
-            return "已请求中断当前 DSH 任务。中断生效后桥接层会推送结果，你可以告诉用户任务已停止。"
-        return result.get("reason") or "当前没有正在执行的任务。"
-
-    @filter.llm_tool(name="continue_dsh_task")
-    async def continue_dsh_task(self, event: AstrMessageEvent, note: str) -> str:
-        """继续执行上一次被中断的 DSH 任务。
-        当用户要求继续、接着做、恢复刚才中断的任务时调用。
-
-        Args:
-            note(string): 继续时的补充说明，可以为空字符串。
-        """
-        if not self._allowed(event):
-            return "这个功能仅限管理员使用。"
-        prompt = "请继续完成刚才被中断的任务，从上次中断的位置接着做，完成后汇报结果。"
-        if note and note.strip():
-            prompt += "\n补充说明：" + note.strip()
-        try:
-            result = await self._bridge("POST", "/task", {
-                "prompt": prompt,
-                "umo": self._report_umo(event),
-                "fileUmo": event.unified_msg_origin if event.get_message_type() == MessageType.GROUP_MESSAGE else "",
-            })
-        except Exception as error:
-            logger.error(f"dsh_bridge 继续任务失败: {error}")
-            return f"继续任务失败：{error}"
-        return (
-            f"已提交继续指令（任务编号 {result['taskId']}）。"
-            "现在请立即向用户回一句简短自然的回执，说明任务已继续，然后停下，不要调用其他工具。"
-        )
 
     @filter.llm_tool(name="read_own_sent_messages")
     async def read_own_sent_messages(
@@ -327,85 +874,40 @@ class Main(star.Star):
             return
         extra = (
             "\n\nDSH 桥接规则：\n"
-            "1. 通过 run_dsh_task 提交的任务，执行结果和产物文件会由桥接层自动发送给用户，"
+            "1. 本插件只提供 5 个 DSH 工具：dsh_session（会话列表、状态、历史、提示词）、"
+            "dsh_task（任务提交、列表、详情、进度、中断、继续）、dsh_approval（待审批项查询）、"
+            "dsh_file（DSH 工作区文件读取与发送）、read_own_sent_messages（读取自己已发送的内容）。"
+            "旧的 run_dsh_task、ask_dsh_progress、cancel_dsh_task、continue_dsh_task、"
+            "send_workspace_file、read_workspace_file、list_dsh_sessions、operate_dsh_session 已经下线，"
+            "不要调用这些名称，也不要用 AstrBot 自带的同类工具代替。\n"
+            "2. 需要在本机执行文件读写、改代码、运行命令、批量处理等实际操作时，用 dsh_task 的 run 动作交给 DSH；"
+            "简单问答、闲聊、知识查询不要调用。\n"
+            "3. 涉及会话与任务的操作必须精确指定目标：会话用 session_id，任务用 task_id。"
+            "编号只能来自工具查询结果，禁止猜测或凭记忆填写；无法唯一确定目标时，先用 dsh_session 的 list "
+            "或 dsh_task 的 list 查询。\n"
+            "4. 提交任务或提示词后必须向用户回一句简短自然的话，说明已转交，并把发给 DSH 的提示词附上。"
+            "回执用你自己的话组织，不要用固定模板。任务结果和产物文件由桥接层自动发送给用户，"
             "不要调用 send_message_to_user 发送 DSH 的结果或文件。\n"
-            "2. 不要主动调用 ask_dsh_progress 确认任务状态，除非用户明确询问进度。\n"
-            "3. 提交任务后必须向用户回一句简短自然的话，说明任务已转交，并把发给 DSH 的提示词附上。"
-            "回执用你自己的话组织，不要用固定模板。\n"
-            "4. 需要在本机执行文件读写、改代码、运行命令、批量处理等实际操作时，必须调用 run_dsh_task "
-            "交给 DSH 执行，不要使用 AstrBot 自带的文件、命令或代码工具；"
-            "本插件提供的 send_workspace_file、read_workspace_file 等工具可以直接使用。"
-            "简单问答、闲聊、知识查询不需要调用。\n"
-            "5. DSH 执行任务时遇到越权操作（工作区外读写、需要提权的命令）会自动向管理员发起审批，"
-            "审批结果由管理员在 QQ 里亲自决定。你不应代替它决定，也不需要向用户解释审批细节。\n"
-            f"6. DSH 只给最高管理员（QQ {self._admin_qq}）使用。其他人询问 DSH、要求用 DSH 做事、"
+            "5. 不要主动查任务状态，除非用户明确询问进度、卡在哪、还要多久、做完了没有。"
+            "查询时用 dsh_task 的 status 或 progress 动作并按 task_id 精确指定；"
+            "用户要求停止或取消时用 cancel 动作；要求继续时用 continue 动作；"
+            "运行中的任务需要追加指令时用 dsh_session 的 prompt 动作并指定 session_id。\n"
+            "6. 读取或发送 DSH 工作区内的文件只用 dsh_file；不要使用 astrbot_file_read_tool、"
+            "astrbot_file_write_tool 等 AstrBot 自带文件工具处理 DSH 工作区。\n"
+            "7. DSH 执行任务时遇到越权操作（工作区外读写、需要提权的命令）会自动向管理员发起审批。"
+            "用 dsh_approval 可以查询待审批项的工具、命令、原因与所属会话；审批决定必须由管理员在 QQ 里亲自回复，"
+            "模型不得代替管理员批准或拒绝，也不要声称审批已经通过。\n"
+            "8. 需要查看会话双方历史消息、DSH 之前的输出，或判断某个会话最近在做什么时，"
+            "用 dsh_session 的 history 或 status 动作读取，不要凭记忆回答。\n"
+            f"9. DSH 只给最高管理员（QQ {self._admin_qq}）使用。其他人询问 DSH、要求用 DSH 做事、"
             "或者让你操作电脑、写文件、跑命令时，必须明确拒绝，不要答应，也不要向他们介绍 DSH 的能力。"
             "拒绝时用普通聊天的语气，不要说教，也不要说'可以'或'我交给它弄'。\n"
-            f"7. 用户提到“工作区”“当前目录”或让 DSH 处理某个文件时，默认指 DSH 工作区：{self._workspace}。"
-            "调用 run_dsh_task 时不要把目标目录改写成 AstrBot 自己的平台工作区路径；"
+            f"10. 用户提到“工作区”“当前目录”或让 DSH 处理某个文件时，默认指 DSH 工作区：{self._workspace}。"
+            "交给 DSH 的任务里不要把目标目录改写成 AstrBot 自己的平台工作区路径；"
             "用户没有给绝对路径时，按 DSH 工作区内的相对路径描述任务。\n"
-            "8. 读取 DSH 工作区内的文件必须使用本插件的 read_workspace_file 工具，"
-            "发送 DSH 工作区内的文件必须使用本插件的 send_workspace_file 工具；"
-            "不要使用 astrbot_file_read_tool、astrbot_file_write_tool 等 AstrBot 自带文件工具处理 DSH 工作区。\n"
         )
         extra += self._recent_sent_note()
         req.system_prompt = (req.system_prompt or "") + extra
-
-    @filter.llm_tool(name="list_dsh_sessions")
-    async def list_dsh_sessions(self, event: AstrMessageEvent) -> str:
-        """列出所有 DSH 会话，包括机器人发起的和用户在 Web 里发起的。
-        当用户询问有哪些会话、查看会话列表、想操作某个会话时调用。
-        """
-        if not self._allowed(event):
-            return "这个功能仅限管理员使用。"
-        try:
-            result = await self._bridge("GET", "/sessions")
-        except Exception as error:
-            return f"获取会话列表失败：{error}"
-        sessions = result.get("sessions", [])
-        if not sessions:
-            return "当前没有任何 DSH 会话。"
-        lines = [f"共 {len(sessions)} 个会话（按最近活动排序）："]
-        for item in sessions[:20]:
-            title = item.get("title") or "（无标题）"
-            cwd = item.get("cwd") or ""
-            tags = []
-            if item.get("archived"):
-                tags.append("已归档")
-            if item.get("pinned"):
-                tags.append("置顶")
-            if item.get("blank"):
-                tags.append("空白")
-            if item.get("running"):
-                tags.append("运行中")
-            status = "、".join(tags) if tags else "正常"
-            lines.append(f"- {item['sessionId']}｜{status}｜{title}｜{cwd}")
-        return "\n".join(lines)
-
-    @filter.llm_tool(name="operate_dsh_session")
-    async def operate_dsh_session(self, event: AstrMessageEvent, session_id: str, action: str, prompt: str) -> str:
-        """操作指定的 DSH 会话：继续（prompt）或中断（cancel）。
-        当用户要求继续某个会话、或中断某个会话时调用。
-        被 Web 页面占用中的会话无法操作，会返回失败原因。
-
-        Args:
-            session_id(string): 会话 ID，来自会话列表
-            action(string): prompt 或 cancel
-            prompt(string): action 为 prompt 时要发送的内容，可以为空
-        """
-        if not self._allowed(event):
-            return "这个功能仅限管理员使用。"
-        try:
-            result = await self._bridge("POST", "/sessions/operate", {
-                "sessionId": session_id,
-                "action": action,
-                "prompt": prompt or "",
-            })
-        except Exception as error:
-            return f"操作会话失败：{error}"
-        if result.get("ok"):
-            return f"已对会话 {session_id} 执行 {action}。"
-        return result.get("error") or "操作失败。"
 
     @filter.on_astrbot_loaded()
     async def on_loaded(self) -> None:

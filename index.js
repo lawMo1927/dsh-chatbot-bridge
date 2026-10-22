@@ -55,12 +55,196 @@ function sendJson(res, statusCode, payload) {
     res.end(JSON.stringify(payload));
 }
 
-function extractAssistantText(event) {
-    const blocks = event?.data?.message?.content || [];
-    return blocks
-        .filter((block) => block && block.type === 'text')
-        .map((block) => block.text)
-        .join('');
+const MAX_BRIDGE_EVENTS = 500;
+const MAX_RECENT_TOOL_CALLS = 500;
+const MAX_EVENT_TEXT_CHARS = 4000;
+const MAX_MESSAGE_TEXT_CHARS = 8000;
+// 桥接自己提交提示词时使用的 requestId 前缀，用于区分机器人提示词与真人提示词
+const QQ_REQUEST_PREFIX = 'qq-req-';
+
+function truncateText(value, max) {
+    const text = value === null || value === undefined ? '' : String(value);
+    return text.length > max ? `${text.slice(0, max)}……（已截断）` : text;
+}
+
+function messageText(message) {
+    const blocks = Array.isArray(message?.content) ? message.content : [];
+    const parts = [];
+    for (const block of blocks) {
+        if (!block || typeof block !== 'object') continue;
+        if (block.type === 'text' && typeof block.text === 'string') parts.push(block.text);
+        else if (block.type === 'image') parts.push('（图片）');
+        else if (block.type === 'file') parts.push('（文件）');
+        else if (block.type === 'tool-call') parts.push(`（调用工具 ${block.name || '未知工具'}）`);
+    }
+    return parts.join('').trim();
+}
+
+function classifyUserSource(source) {
+    if (!source || typeof source !== 'object') return 'human';
+    if (typeof source.rpcId === 'string' && source.rpcId) {
+        return source.rpcId.startsWith(QQ_REQUEST_PREFIX) ? 'bot' : 'human';
+    }
+    return source.kind === 'user' ? 'human' : 'system';
+}
+
+// 把会话原始事件压缩成增量事件流里的紧凑形状
+function summarizeSessionEvent(event) {
+    const data = event.data || {};
+    if (event.type === 'user/message') {
+        const source = classifyUserSource(data.message?.source);
+        return {
+            type: 'user/message',
+            data: {
+                role: 'user',
+                source,
+                kind: source === 'system' ? 'status' : 'prompt',
+                text: truncateText(messageText(data.message), MAX_EVENT_TEXT_CHARS)
+            }
+        };
+    }
+    if (event.type === 'assistant/message') {
+        return {
+            type: 'assistant/message',
+            data: {
+                role: 'assistant',
+                source: 'dsh',
+                kind: 'text',
+                text: truncateText(messageText(data.message), MAX_EVENT_TEXT_CHARS),
+                turn: data.turn,
+                step: data.step
+            }
+        };
+    }
+    if (event.type === 'tool/call') {
+        return {
+            type: 'tool/call',
+            data: {
+                text: `调用工具 ${data.name || '未知工具'}`,
+                toolName: data.name || '',
+                callId: data.callId ? String(data.callId) : null,
+                command: truncateText(data.arguments, MAX_EVENT_TEXT_CHARS)
+            }
+        };
+    }
+    if (event.type === 'tool/result') {
+        const failed = Boolean(data.message && data.message.isError);
+        return {
+            type: 'tool/result',
+            data: {
+                text: failed ? '工具执行失败' : '工具执行结果已返回',
+                callId: data.message && data.message.toolCallId ? String(data.message.toolCallId) : null,
+                isError: failed
+            }
+        };
+    }
+    if (event.type === 'turn/start') {
+        return { type: 'turn/start', data: { text: '回合开始', turn: data.turn } };
+    }
+    if (event.type === 'turn/end') {
+        return {
+            type: 'turn/end',
+            data: { text: '回合结束', turn: data.turn, reason: (data.reason && data.reason.kind) || 'completed' }
+        };
+    }
+    if (event.type === 'step/start') {
+        return {
+            type: 'step/start',
+            data: {
+                text: `第 ${data.turn} 回合第 ${data.step} 步`,
+                turn: data.turn,
+                step: data.step,
+                phase: `第 ${data.turn} 回合第 ${data.step} 步`
+            }
+        };
+    }
+    if (event.type === 'approval/asked') {
+        return {
+            type: 'approval/asked',
+            data: {
+                text: '等待审批',
+                toolName: data.toolName || '',
+                approvalId: data.id ? String(data.id) : null,
+                reason: data.reason || ''
+            }
+        };
+    }
+    if (event.type === 'approval/decided') {
+        return {
+            type: 'approval/decided',
+            data: { text: '审批已结束', approvalId: data.id ? String(data.id) : null, outcome: data.outcome || '' }
+        };
+    }
+    if (event.type === 'session/title') {
+        return { type: 'session/title', data: { text: data.title || '', title: data.title || '' } };
+    }
+    return null;
+}
+
+// 把会话历史记录转换成双方消息条目
+function historyMessage(record) {
+    const event = record && record.event ? record.event : null;
+    if (!event || !Number.isInteger(event.seq)) return null;
+    const data = event.data || {};
+    if (event.type === 'user/message') {
+        const source = classifyUserSource(data.message?.source);
+        return {
+            seq: event.seq,
+            time: event.time,
+            role: 'user',
+            source,
+            kind: source === 'system' ? 'status' : 'prompt',
+            text: truncateText(messageText(data.message), MAX_MESSAGE_TEXT_CHARS)
+        };
+    }
+    if (event.type === 'assistant/message') {
+        const text = truncateText(messageText(data.message), MAX_MESSAGE_TEXT_CHARS);
+        if (!text) return null;
+        return { seq: event.seq, time: event.time, role: 'assistant', source: 'dsh', kind: 'text', text };
+    }
+    if (event.type === 'tool/call') {
+        return {
+            seq: event.seq,
+            time: event.time,
+            role: 'assistant',
+            source: 'dsh',
+            kind: 'tool',
+            text: truncateText(`调用工具 ${data.name || '未知工具'}：${data.arguments || ''}`, MAX_MESSAGE_TEXT_CHARS)
+        };
+    }
+    if (event.type === 'tool/result') {
+        const failed = Boolean(data.message && data.message.isError);
+        const resultText = messageText(data.message);
+        return {
+            seq: event.seq,
+            time: event.time,
+            role: 'assistant',
+            source: 'dsh',
+            kind: 'tool',
+            text: truncateText(
+                `${failed ? '工具执行失败' : '工具执行结果'}${resultText ? '：' + resultText : ''}`,
+                MAX_MESSAGE_TEXT_CHARS
+            )
+        };
+    }
+    if (event.type === 'approval/asked') {
+        const reason = data.reason ? `，原因：${data.reason}` : '';
+        return {
+            seq: event.seq,
+            time: event.time,
+            role: 'system',
+            source: 'system',
+            kind: 'approval',
+            text: truncateText(`等待审批：工具 ${data.toolName || '未知工具'}${reason}`, MAX_MESSAGE_TEXT_CHARS)
+        };
+    }
+    return null;
+}
+
+function isSessionNotFoundError(error) {
+    if (!error) return false;
+    if (error.code === 'session/not-found' || error.code === 'subagent/not-found') return true;
+    return /session ["'][^"']*["'] not found/.test(String(error.message || ''));
 }
 
 export function apply(ctx, pluginConfig) {
@@ -68,10 +252,175 @@ export function apply(ctx, pluginConfig) {
     const log = createLogger(config.logFile);
     const manager = new TaskManager(config.workspace);
     const pendingApprovals = new Map();
+    const recentToolCalls = new Map();
+    const bridgeEvents = [];
+    // sessionId -> 当前打开的回合号，用于把追加指令绑定到正确的回合
+    const openTurns = new Map();
+    let bridgeEventSeq = 0;
     let approvalSeq = 1;
     let shuttingDown = false;
     let sessionReady = null;
     let spawnState = { astrbot: null };
+
+    function recordBridgeEvent(sessionId, type, data, taskId) {
+        bridgeEventSeq += 1;
+        bridgeEvents.push({
+            seq: bridgeEventSeq,
+            time: Date.now(),
+            sessionId: sessionId || null,
+            taskId: taskId || null,
+            type,
+            data: data || {}
+        });
+        if (bridgeEvents.length > MAX_BRIDGE_EVENTS) {
+            bridgeEvents.splice(0, bridgeEvents.length - MAX_BRIDGE_EVENTS);
+        }
+    }
+
+    function recordTaskEvent(type, task, extra) {
+        if (!task) return;
+        recordBridgeEvent(task.sessionId, type, {
+            status: task.status,
+            phase: task.phase,
+            durationMs: task.durationMs,
+            error: task.error || null,
+            ...(extra || {})
+        }, task.id);
+    }
+
+    // 会话事件只有属于本任务自己的回合时才标注 taskId，避免把别的回合算到任务头上
+    function activeTaskIdFor(sessionId) {
+        const taskId = manager.currentTaskFor(sessionId);
+        if (!taskId) return null;
+        const task = manager.getTask(taskId);
+        if (!task || task.status !== 'running' || task.awaitTurnStart) return null;
+        return taskId;
+    }
+
+    function rememberToolCall(sessionId, event) {
+        const callId = event.data && event.data.callId ? String(event.data.callId) : '';
+        if (!callId) return;
+        recentToolCalls.set(callId, {
+            sessionId,
+            name: String((event.data && event.data.name) || ''),
+            arguments: String((event.data && event.data.arguments) || '')
+        });
+        while (recentToolCalls.size > MAX_RECENT_TOOL_CALLS) {
+            const oldest = recentToolCalls.keys().next().value;
+            recentToolCalls.delete(oldest);
+        }
+    }
+
+    function approvalContext(req) {
+        const sessionId = (req && req.agent && ((req.agent.session && req.agent.session.id) || req.agent.id)) || null;
+        const taskId = sessionId ? manager.currentTaskFor(sessionId) : null;
+        const callId = req && req.callId ? String(req.callId) : '';
+        const call = callId ? recentToolCalls.get(callId) : null;
+        return {
+            sessionId,
+            taskId,
+            command: call ? call.arguments : null
+        };
+    }
+
+    function clampLimit(raw, fallback) {
+        const value = Number(raw);
+        if (!Number.isFinite(value) || value <= 0) return fallback;
+        return Math.min(Math.max(Math.trunc(value), 1), 100);
+    }
+
+    function finishedReportText(task) {
+        if (task.status === 'cancelled') return task.error || '任务被中断';
+        if (task.status === 'failed') return `任务执行失败：${task.error || '未知错误'}`;
+        return '任务已完成，结果已加入报告队列';
+    }
+
+    function finishTaskById(taskId, options) {
+        const finished = manager.finishTask(taskId, options);
+        if (!finished) return null;
+        const report = manager.reportForTask(finished.id);
+        recordTaskEvent('task/finished', finished, { text: finishedReportText(finished) });
+        recordBridgeEvent(finished.sessionId, 'report/created', {
+            text: '任务结果已加入报告队列',
+            files: report ? report.files.length : 0,
+            sessionTitle: report ? report.sessionTitle : ''
+        }, finished.id);
+        log(`任务 ${finished.id} 结束 status=${finished.status} duration=${finished.durationMs === null ? '-' : finished.durationMs + 'ms'}`);
+        setImmediate(pumpQueue);
+        return finished;
+    }
+
+    function finishSessionTask(sessionId, options) {
+        const taskId = manager.currentTaskFor(sessionId);
+        if (!taskId) return null;
+        return finishTaskById(taskId, options);
+    }
+
+    function turnEndOutcome(event) {
+        const reason = event.data && event.data.reason ? event.data.reason : null;
+        const kind = reason && reason.kind ? reason.kind : 'completed';
+        if (kind === 'error') {
+            const failure = reason.error && (reason.error.message || reason.error.code);
+            return { error: failure ? String(failure) : '回合异常结束' };
+        }
+        if (kind === 'aborted') return { cancelled: true, error: '任务被中断' };
+        if (kind === 'blocked') return { error: '回合被阻塞' };
+        return {};
+    }
+
+    function handleTurnStart(sessionId, event) {
+        const turn = event.data && Number.isInteger(event.data.turn) ? event.data.turn : null;
+        if (turn === null) return;
+        openTurns.set(sessionId, turn);
+        const taskId = manager.currentTaskFor(sessionId);
+        if (taskId) manager.bindTurn(taskId, turn);
+    }
+
+    function handleTurnEnd(sessionId, event) {
+        const turn = event.data && Number.isInteger(event.data.turn) ? event.data.turn : null;
+        if (turn !== null && openTurns.get(sessionId) === turn) openTurns.delete(sessionId);
+        const taskId = manager.currentTaskFor(sessionId);
+        if (!taskId) return;
+        const task = manager.getTask(taskId);
+        if (!task) return;
+        // 排队提交的任务还没等到自己的回合，这一轮的结束不算它的结果
+        if (task.awaitTurnStart) return;
+        if (task.turnNumber !== null && turn !== null && task.turnNumber !== turn) return;
+        finishTaskById(taskId, turnEndOutcome(event));
+    }
+
+    function handleSessionEvent(session, event) {
+        if (!event || typeof event.type !== 'string') return;
+        const sessionId = (session && (session.id || (session.header && session.header.id))) || null;
+        if (!sessionId) return;
+        const eventTaskId = activeTaskIdFor(sessionId);
+
+        if (event.type === 'tool/call') rememberToolCall(sessionId, event);
+        if (event.type === 'assistant/message') {
+            if (eventTaskId) manager.recordAssistantText(sessionId, messageText(event.data && event.data.message));
+            manager.recordPhase(eventTaskId, '生成回复');
+        }
+        if (event.type === 'step/start') {
+            const data = event.data || {};
+            manager.recordPhase(eventTaskId, `第 ${data.turn} 回合第 ${data.step} 步`);
+        }
+        if (event.type === 'tool/call') {
+            manager.recordPhase(eventTaskId, `调用工具 ${(event.data && event.data.name) || '未知工具'}`);
+        }
+        if (event.type === 'tool/result') {
+            manager.recordPhase(eventTaskId, '处理工具结果');
+        }
+        if (event.type === 'session/title') {
+            manager.recordSessionTitle(sessionId, event.data && event.data.title);
+        }
+        if (event.type === 'turn/start') handleTurnStart(sessionId, event);
+        if (event.type === 'turn/end') handleTurnEnd(sessionId, event);
+
+        const summary = summarizeSessionEvent(event);
+        if (summary) {
+            recordBridgeEvent(sessionId, summary.type, summary.data, activeTaskIdFor(sessionId) || eventTaskId);
+        }
+    }
 
     function loadState() {
         try {
@@ -160,9 +509,8 @@ export function apply(ctx, pluginConfig) {
         return sessionReady;
     }
 
-    async function submitPrompt(text, mode) {
-        const sessionId = await ensureSession();
-        const requestId = `qq-req-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`;
+    async function submitPrompt(sessionId, text, mode) {
+        const requestId = `${QQ_REQUEST_PREFIX}${Date.now()}-${crypto.randomBytes(3).toString('hex')}`;
         const controller = new AbortController();
         await ctx.sessionController.prompt({
             requestId,
@@ -174,53 +522,31 @@ export function apply(ctx, pluginConfig) {
     }
 
     function pumpQueue() {
-        if (manager.currentTaskId) return;
-        const task = manager.nextQueued();
-        if (!task) return;
-        manager.markRunning(task.id);
-        submitPrompt(task.prompt, 'queue')
-            .then((info) => {
-                log(`任务 ${task.id} 已提交 session=${info.sessionId}`);
-            })
-            .catch((error) => {
-                log(`任务 ${task.id} 提交失败: ${error.message}`);
-                manager.markFinished({ error: error.message });
-                setImmediate(pumpQueue);
-            });
-    }
-
-    function completeCurrentTask(reason) {
-        if (!manager.currentTaskId) return;
-        const finished = manager.markFinished(reason ? { error: reason } : undefined);
-        if (finished) {
-            log(`任务 ${finished.id} 结束 status=${finished.status}`);
+        while (true) {
+            const task = manager.nextStartable();
+            if (!task) return;
+            try {
+                manager.markRunning(task.id);
+            } catch (error) {
+                log(`任务 ${task.id} 启动失败: ${error.message}`);
+                finishTaskById(task.id, { error: `任务启动失败：${error.message}` });
+                continue;
+            }
+            recordTaskEvent('task/started', task, { text: '任务开始执行' });
+            log(`任务 ${task.id} 已提交 session=${task.sessionId}`);
+            submitPrompt(task.sessionId, task.prompt, 'queue')
+                .then(() => {
+                    log(`任务 ${task.id} 已进入会话 ${task.sessionId}`);
+                })
+                .catch((error) => {
+                    log(`任务 ${task.id} 提交失败: ${error.message}`);
+                    finishTaskById(task.id, { error: `任务提交失败：${error.message}` });
+                });
         }
-        setImmediate(pumpQueue);
     }
 
     const eventDisposer = ctx.on('session/event', (session, event) => {
-        const sessionId = manager.sessionId;
-        if (!sessionId || session.header?.id !== sessionId) return;
-
-        if (event.type === 'assistant/message') {
-            const text = extractAssistantText(event);
-            manager.recordAssistantText(text);
-            return;
-        }
-
-        if (event.type === 'session/title') {
-            manager.recordSessionTitle(event.data?.title);
-            return;
-        }
-
-        if (event.type === 'turn/end') {
-            const reason = event.data?.reason;
-            if (reason === 'error') {
-                completeCurrentTask('回合异常结束');
-            } else {
-                completeCurrentTask();
-            }
-        }
+        handleSessionEvent(session, event);
     });
     ctx.effect(() => eventDisposer);
 
@@ -229,7 +555,8 @@ export function apply(ctx, pluginConfig) {
     const approvalDisposer = ctx.on('approval/request', async (req, next) => {
         if (!manager.sessionId) return next();
         const id = `approval_${Date.now()}_${approvalSeq++}`;
-        log(`收到审批请求 ${id}: tool=${req.toolName} reason=${req.reason}`);
+        const context = approvalContext(req);
+        log(`收到审批请求 ${id}: tool=${req.toolName} reason=${req.reason} session=${context.sessionId || '-'}`);
 
         const pagePromise = next().then(
             (outcome) => {
@@ -250,35 +577,55 @@ export function apply(ctx, pluginConfig) {
                 pendingApprovals.delete(id);
                 resolve('rejected');
             }, config.approvalTimeoutSeconds * 1000);
-            pendingApprovals.set(id, {
+            const entry = {
                 id,
                 toolName: String(req.toolName || ''),
                 reason: String(req.reason || ''),
                 callId: req.callId ? String(req.callId) : '',
+                sessionId: context.sessionId,
+                taskId: context.taskId,
+                command: context.command,
                 createdAt: new Date().toISOString(),
                 resolve: (value) => {
                     clearTimeout(timer);
                     pendingApprovals.delete(id);
                     resolve(value);
                 }
-            });
+            };
+            pendingApprovals.set(id, entry);
+            recordBridgeEvent(entry.sessionId, 'approval/pending', {
+                text: '等待审批',
+                toolName: entry.toolName,
+                reason: entry.reason,
+                command: truncateText(entry.command, MAX_EVENT_TEXT_CHARS),
+                approvalId: id
+            }, entry.taskId);
         });
 
         const outcome = await Promise.race([pagePromise, qqPromise]);
         pendingApprovals.delete(id);
+        recordBridgeEvent(context.sessionId, 'approval/decided', {
+            text: '审批已结束',
+            approvalId: id,
+            outcome,
+            allowed: outcome === 'allow' || outcome === 'allowed-once'
+        }, context.taskId);
         log(`审批 ${id} 结果: ${outcome}`);
         return outcome === 'allow' || outcome === 'allowed-once' ? 'allowed-once' : 'rejected';
     }, { prepend: true });
     ctx.effect(() => approvalDisposer);
 
-    const timeoutTimer = setInterval(() => {
-        if (!manager.currentTaskId) return;
-        const task = manager.getTask(manager.currentTaskId);
-        if (!task || !task.startedAt) return;
-        const elapsedMs = Date.now() - Date.parse(task.startedAt);
-        if (elapsedMs > config.taskTimeoutMinutes * 60_000) {
+    const timeoutTimer = setInterval(async () => {
+        for (const task of manager.runningTasks()) {
+            if (!task.startedAtMs) continue;
+            if (Date.now() - task.startedAtMs <= config.taskTimeoutMinutes * 60_000) continue;
             log(`任务 ${task.id} 超时，标记失败`);
-            completeCurrentTask(`任务超时（${config.taskTimeoutMinutes} 分钟）`);
+            try {
+                await ctx.sessionController.cancel({ sessionId: task.sessionId });
+            } catch (error) {
+                log(`任务 ${task.id} 超时后中断会话失败: ${error.message}`);
+            }
+            finishTaskById(task.id, { error: `任务超时（${config.taskTimeoutMinutes} 分钟）` });
         }
     }, 30_000);
     ctx.effect(() => () => clearInterval(timeoutTimer));
@@ -307,12 +654,21 @@ export function apply(ctx, pluginConfig) {
         }
     }
 
+    function approvalSessionIds() {
+        const ids = new Set();
+        for (const item of pendingApprovals.values()) {
+            if (item.sessionId) ids.add(item.sessionId);
+        }
+        return ids;
+    }
+
     async function listSessions() {
         const controller = new AbortController();
         const timer = setTimeout(() => controller.abort(), 8000);
         try {
             const value = await ctx.sessionController.list({}, controller.signal);
             const flags = workspaceFlags();
+            const waiting = approvalSessionIds();
             const items = (value.items || [])
                 .filter((item) => !item.parentSessionId && item.origin !== 'subagent')
                 .map((item) => ({
@@ -323,12 +679,135 @@ export function apply(ctx, pluginConfig) {
                     archived: flags.archived.has(item.sessionId),
                     pinned: flags.pinned.has(item.sessionId),
                     blank: item.blank,
-                    running: item.running
+                    running: item.running,
+                    currentTaskId: manager.currentTaskFor(item.sessionId),
+                    taskIds: manager.taskIdsForSession(item.sessionId),
+                    waitingApproval: waiting.has(item.sessionId)
                 }));
             return items;
         } finally {
             clearTimeout(timer);
         }
+    }
+
+    function isSessionRunning(sessionId) {
+        if (manager.currentTaskFor(sessionId)) return true;
+        const agent = ctx.agents.get(sessionId);
+        return Boolean(agent && agent.status === 'running');
+    }
+
+    async function inspectSession(sessionId) {
+        const live = ctx.sessions.get(sessionId);
+        if (live) return live;
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), 8000);
+        try {
+            return await ctx.sessionController.inspect(sessionId, controller.signal);
+        } finally {
+            clearTimeout(timer);
+        }
+    }
+
+    // target 可以是 { sessionId }、{ taskId }，都为空时使用桥接会话
+    async function resolveTargetSession(target) {
+        if (target && target.taskId) {
+            const taskId = String(target.taskId);
+            const task = manager.getTask(taskId);
+            if (!task || !task.sessionId) {
+                return { error: { status: 404, message: `任务不存在或没有关联会话: ${taskId}` } };
+            }
+            if (target.sessionId && String(target.sessionId) !== task.sessionId) {
+                return { error: { status: 404, message: `任务 ${taskId} 不属于会话 ${target.sessionId}` } };
+            }
+            return { sessionId: task.sessionId };
+        }
+        if (target && target.sessionId) {
+            const sessionId = String(target.sessionId);
+            try {
+                await inspectSession(sessionId);
+            } catch (error) {
+                if (isSessionNotFoundError(error)) {
+                    return { error: { status: 404, message: `会话不存在: ${sessionId}` } };
+                }
+                throw error;
+            }
+            return { sessionId };
+        }
+        return { sessionId: await ensureSession() };
+    }
+
+    function promptErrorStatus(error) {
+        if (isSessionNotFoundError(error)) return 404;
+        if (error && (error.code === 'session/steer-unavailable' || error.code === 'session/agent-busy')) return 409;
+        return 500;
+    }
+
+    async function taskDetailView(task) {
+        const detail = manager.taskDetail(task);
+        const title = task.sessionTitle || sessionTitle(task.sessionId) || '';
+        const running = isSessionRunning(task.sessionId);
+        detail.sessionTitle = title;
+        detail.sessionStatus = running ? 'running' : 'idle';
+        detail.session = { sessionId: task.sessionId, title, running };
+        return detail;
+    }
+
+    async function readSessionHistory(sessionId, limit, beforeSeq) {
+        const address = { kind: 'session', sessionId };
+        const streamController = new AbortController();
+        const streamTimer = setTimeout(() => streamController.abort(), 15000);
+        const stream = ctx.sessionController.follow({ address, maxMessages: limit }, streamController.signal);
+        const iterator = stream[Symbol.asyncIterator]();
+        let snapshot;
+        try {
+            const first = await iterator.next();
+            if (first.done || !first.value || first.value.type !== 'snapshot') {
+                throw new Error('会话历史读取没有返回快照');
+            }
+            snapshot = first.value;
+        } finally {
+            clearTimeout(streamTimer);
+            streamController.abort();
+            await iterator.return();
+        }
+
+        let records = snapshot.records || [];
+        let hasMore = Boolean(snapshot.hasMore);
+        if (beforeSeq !== null) {
+            const pageController = new AbortController();
+            const pageTimer = setTimeout(() => pageController.abort(), 10000);
+            try {
+                const page = await ctx.sessionController.page({
+                    address,
+                    throughSeq: snapshot.cursor,
+                    beforeSeq,
+                    maxMessages: limit
+                }, pageController.signal);
+                records = page.records || [];
+                hasMore = Boolean(page.hasMore);
+            } finally {
+                clearTimeout(pageTimer);
+            }
+        }
+
+        const messages = [];
+        for (const record of records) {
+            const message = historyMessage(record);
+            if (message) messages.push(message);
+        }
+        messages.sort((a, b) => a.seq - b.seq);
+        let result = messages;
+        if (result.length > limit) {
+            hasMore = true;
+            result = result.slice(result.length - limit);
+        }
+        return {
+            sessionId,
+            cursor: snapshot.cursor,
+            order: 'ascending',
+            hasMore,
+            messages: result
+        };
     }
 
     let napcatCredential = null;
@@ -693,33 +1172,149 @@ export function apply(ctx, pluginConfig) {
                 if (typeof body.prompt !== 'string' || body.prompt.trim() === '') {
                     return sendJson(res, 400, { error: '缺少 prompt' });
                 }
-                const task = manager.createTask({ prompt: body.prompt.trim(), umo: body.umo || '', fileUmo: body.fileUmo || '' });
-                log(`收到任务 ${task.id} from=${body.umo || 'unknown'}`);
+                const sessionId = await ensureSession();
+                const task = manager.createTask({
+                    prompt: body.prompt.trim(),
+                    umo: body.umo || '',
+                    fileUmo: body.fileUmo || '',
+                    sessionId
+                });
+                recordTaskEvent('task/queued', task, { text: '任务已排队' });
+                log(`收到任务 ${task.id} session=${sessionId} from=${body.umo || 'unknown'}`);
                 setImmediate(pumpQueue);
                 return sendJson(res, 200, { taskId: task.id, status: 'queued' });
             }
 
-            if (req.method === 'GET' && url.pathname.startsWith('/task/')) {
-                const taskId = url.pathname.slice('/task/'.length);
-                const task = manager.getTask(taskId);
-                if (!task) return sendJson(res, 404, { error: '任务不存在' });
-                return sendJson(res, 200, task);
+            if (req.method === 'GET' && url.pathname === '/tasks') {
+                const sessionId = url.searchParams.get('sessionId') || '';
+                const status = url.searchParams.get('status') || '';
+                const limit = clampLimit(url.searchParams.get('limit'), 50);
+                const tasks = manager.listTasks({ sessionId, status, limit }).map((task) => manager.taskSummary(task));
+                return sendJson(res, 200, { tasks });
             }
 
-            if (req.method === 'POST' && url.pathname === '/task/cancel') {
-                if (!manager.currentTaskId) {
-                    return sendJson(res, 200, { ok: false, reason: '当前没有正在执行的任务' });
-                }
-                const taskId = manager.currentTaskId;
-                try {
-                    await ctx.sessionController.cancel({ sessionId: manager.sessionId });
-                    manager.markFinished({ error: '任务被中断', cancelled: true });
-                    log(`任务 ${taskId} 已中断`);
-                    setImmediate(pumpQueue);
+            if (req.method === 'POST' && url.pathname.startsWith('/tasks/') && url.pathname.endsWith('/cancel')) {
+                const taskId = decodeURIComponent(url.pathname.slice('/tasks/'.length, -'/cancel'.length));
+                const task = taskId ? manager.getTask(taskId) : null;
+                if (!task) return sendJson(res, 404, { ok: false, error: `任务不存在: ${taskId}` });
+                if (!task.sessionId) return sendJson(res, 404, { ok: false, error: `任务没有关联会话: ${taskId}` });
+                if (task.status === 'queued') {
+                    finishTaskById(taskId, { cancelled: true, error: '任务在排队时被中断' });
+                    log(`排队中的任务 ${taskId} 已中断`);
                     return sendJson(res, 200, { ok: true, taskId });
+                }
+                if (task.status !== 'running') {
+                    return sendJson(res, 200, { ok: false, reason: `任务已经结束（${task.status}）` });
+                }
+                try {
+                    await ctx.sessionController.cancel({ sessionId: task.sessionId });
                 } catch (error) {
                     return sendJson(res, 500, { ok: false, error: error.message });
                 }
+                finishTaskById(taskId, { cancelled: true, error: '任务被中断' });
+                log(`任务 ${taskId} 已中断 session=${task.sessionId}`);
+                return sendJson(res, 200, { ok: true, taskId });
+            }
+
+            if (req.method === 'POST' && url.pathname.startsWith('/tasks/') && url.pathname.endsWith('/continue')) {
+                const taskId = decodeURIComponent(url.pathname.slice('/tasks/'.length, -'/continue'.length));
+                const task = taskId ? manager.getTask(taskId) : null;
+                if (!task) return sendJson(res, 404, { error: `任务不存在: ${taskId}` });
+                if (!task.sessionId) return sendJson(res, 404, { error: `任务没有关联会话: ${taskId}` });
+                const body = JSON.parse(await readBody(req));
+                const answer = typeof body.prompt === 'string' && body.prompt.trim()
+                    ? body.prompt.trim()
+                    : '请继续刚才中断的任务，从上次中断的位置接着做，完成后汇报结果。';
+                const next = manager.createTask({
+                    prompt: answer,
+                    umo: body.umo || '',
+                    fileUmo: body.fileUmo || '',
+                    sessionId: task.sessionId
+                });
+                recordTaskEvent('task/queued', next, { text: '继续指令已排队' });
+                log(`任务 ${next.id} 继续任务 ${taskId} session=${task.sessionId}`);
+                setImmediate(pumpQueue);
+                return sendJson(res, 200, { taskId: next.id, sessionId: task.sessionId, accepted: true });
+            }
+
+            if (req.method === 'GET' && url.pathname.startsWith('/tasks/')) {
+                const taskId = decodeURIComponent(url.pathname.slice('/tasks/'.length));
+                const task = taskId ? manager.getTask(taskId) : null;
+                if (!task) return sendJson(res, 404, { error: `任务不存在: ${taskId}` });
+                return sendJson(res, 200, await taskDetailView(task));
+            }
+
+            if (req.method === 'POST' && url.pathname === '/prompt') {
+                const body = JSON.parse(await readBody(req));
+                const prompt = typeof body.prompt === 'string' ? body.prompt.trim() : '';
+                if (!prompt) return sendJson(res, 400, { accepted: false, error: '缺少 prompt' });
+                const mode = ['auto', 'queue', 'steer'].includes(body.mode) ? body.mode : 'auto';
+                const target = body.target && typeof body.target === 'object' ? body.target : {};
+                const resolved = await resolveTargetSession(target);
+                if (resolved.error) {
+                    return sendJson(res, resolved.error.status, { accepted: false, error: resolved.error.message });
+                }
+                const sessionId = resolved.sessionId;
+                const umo = typeof body.umo === 'string' ? body.umo : '';
+                const fileUmo = typeof body.fileUmo === 'string' ? body.fileUmo : '';
+                const running = isSessionRunning(sessionId);
+
+                if (mode === 'steer' || (mode === 'auto' && running)) {
+                    let taskId = manager.currentTaskFor(sessionId);
+                    let boundTask = null;
+                    if (!taskId) {
+                        boundTask = manager.bindRunningTask({
+                            sessionId,
+                            prompt,
+                            umo,
+                            fileUmo,
+                            turnNumber: openTurns.has(sessionId) ? openTurns.get(sessionId) : null
+                        });
+                        taskId = boundTask.id;
+                        recordTaskEvent('task/started', boundTask, { text: '追加指令已绑定运行中的回合' });
+                    } else if (manager.getTask(taskId).awaitTurnStart) {
+                        return sendJson(res, 409, {
+                            accepted: false,
+                            taskId,
+                            sessionId,
+                            error: '目标会话有排队中的任务，暂时不能追加指令'
+                        });
+                    }
+                    try {
+                        await submitPrompt(sessionId, prompt, 'steer');
+                    } catch (error) {
+                        if (boundTask) finishTaskById(boundTask.id, { error: `追加指令提交失败：${error.message}` });
+                        log(`向会话 ${sessionId} 追加指令失败: ${error.message}`);
+                        return sendJson(res, promptErrorStatus(error), { accepted: false, error: error.message });
+                    }
+                    recordBridgeEvent(sessionId, 'prompt/steer', {
+                        text: '已向运行中的会话追加指令',
+                        prompt: truncateText(prompt, MAX_EVENT_TEXT_CHARS)
+                    }, taskId);
+                    log(`已向会话 ${sessionId} 追加指令 task=${taskId}`);
+                    return sendJson(res, 200, { taskId, sessionId, accepted: true, mode: 'steer' });
+                }
+
+                const task = manager.createTask({ prompt, umo, fileUmo, sessionId });
+                recordTaskEvent('task/queued', task, { text: '任务已排队' });
+                log(`收到提示词任务 ${task.id} session=${sessionId} mode=${mode}`);
+                setImmediate(pumpQueue);
+                return sendJson(res, 200, { taskId: task.id, sessionId, accepted: true, mode: 'queue' });
+            }
+
+            if (req.method === 'POST' && url.pathname === '/task/cancel') {
+                const taskId = manager.currentTaskId;
+                if (!taskId) {
+                    return sendJson(res, 200, { ok: false, reason: '当前没有正在执行的任务' });
+                }
+                try {
+                    await ctx.sessionController.cancel({ sessionId: manager.sessionId });
+                } catch (error) {
+                    return sendJson(res, 500, { ok: false, error: error.message });
+                }
+                finishTaskById(taskId, { cancelled: true, error: '任务被中断' });
+                log(`任务 ${taskId} 已中断`);
+                return sendJson(res, 200, { ok: true, taskId });
             }
 
             if (req.method === 'POST' && url.pathname === '/task/continue') {
@@ -728,35 +1323,77 @@ export function apply(ctx, pluginConfig) {
                 if (manager.currentTaskId) {
                     return sendJson(res, 409, { ok: false, error: '还有任务正在执行' });
                 }
-                const task = manager.createTask({ prompt: answer, umo: body.umo || '', fileUmo: body.fileUmo || '' });
+                const sessionId = await ensureSession();
+                const task = manager.createTask({
+                    prompt: answer,
+                    umo: body.umo || '',
+                    fileUmo: body.fileUmo || '',
+                    sessionId
+                });
+                recordTaskEvent('task/queued', task, { text: '继续任务已排队' });
                 log(`继续任务 ${task.id}: ${answer}`);
                 setImmediate(pumpQueue);
                 return sendJson(res, 200, { ok: true, taskId: task.id });
             }
 
+            if (req.method === 'GET' && url.pathname.startsWith('/task/')) {
+                const taskId = decodeURIComponent(url.pathname.slice('/task/'.length));
+                const task = taskId ? manager.getTask(taskId) : null;
+                if (!task) return sendJson(res, 404, { error: '任务不存在' });
+                return sendJson(res, 200, await taskDetailView(task));
+            }
+
             if (req.method === 'POST' && url.pathname === '/progress') {
                 const body = JSON.parse(await readBody(req));
                 const question = typeof body.question === 'string' ? body.question.trim() : '';
-                if (manager.currentTaskId) {
+                const requestedTaskId = typeof body.taskId === 'string' && body.taskId.trim() ? body.taskId.trim() : '';
+                const requestedSessionId = typeof body.sessionId === 'string' && body.sessionId.trim()
+                    ? body.sessionId.trim()
+                    : manager.sessionId;
+
+                if (requestedTaskId) {
+                    const task = manager.getTask(requestedTaskId);
+                    if (!task) return sendJson(res, 404, { error: '任务不存在' });
+                    if (task.status === 'running' && question) {
+                        try {
+                            await submitPrompt(task.sessionId, question, 'steer');
+                        } catch (error) {
+                            log(`进度插话失败: ${error.message}`);
+                        }
+                    }
+                    return sendJson(res, 200, {
+                        status: task.status,
+                        taskId: task.id,
+                        sessionId: task.sessionId,
+                        reply: task.status === 'running'
+                            ? (manager.lastAssistantText(task.sessionId) || null)
+                            : (task.lastMessage || task.error || null)
+                    });
+                }
+
+                const currentTaskId = requestedSessionId ? manager.currentTaskFor(requestedSessionId) : null;
+                if (currentTaskId) {
                     if (question) {
                         try {
-                            await submitPrompt(question, 'steer');
+                            await submitPrompt(requestedSessionId, question, 'steer');
                             log(`进度询问已插话: ${question}`);
                         } catch (error) {
                             log(`进度插话失败: ${error.message}`);
                         }
                     }
-                    const task = manager.getTask(manager.currentTaskId);
+                    const task = manager.getTask(currentTaskId);
                     return sendJson(res, 200, {
                         status: 'running',
                         taskId: task ? task.id : null,
-                        reply: manager.lastAssistantText || null
+                        sessionId: requestedSessionId,
+                        reply: manager.lastAssistantText(requestedSessionId) || null
                     });
                 }
-                const last = manager.getLastCompletedTask();
+                const last = manager.getLastCompletedTask(requestedSessionId);
                 return sendJson(res, 200, {
                     status: last ? 'completed' : 'idle',
                     taskId: last ? last.id : null,
+                    sessionId: requestedSessionId || null,
                     reply: last && last.lastMessage ? last.lastMessage : '现在没有正在执行的任务。'
                 });
             }
@@ -777,6 +1414,9 @@ export function apply(ctx, pluginConfig) {
                     toolName: item.toolName,
                     reason: item.reason,
                     callId: item.callId,
+                    sessionId: item.sessionId,
+                    taskId: item.taskId,
+                    command: item.command,
                     createdAt: item.createdAt
                 }));
                 return sendJson(res, 200, { pending });
@@ -795,6 +1435,35 @@ export function apply(ctx, pluginConfig) {
                 return sendJson(res, 200, { sessions });
             }
 
+            if (req.method === 'GET' && url.pathname.startsWith('/sessions/') && url.pathname.endsWith('/history')) {
+                const sessionId = decodeURIComponent(url.pathname.slice('/sessions/'.length, -'/history'.length));
+                if (!sessionId) return sendJson(res, 400, { error: '缺少 sessionId' });
+                const limit = clampLimit(url.searchParams.get('limit'), 20);
+                const beforeSeqRaw = Number(url.searchParams.get('beforeSeq'));
+                const beforeSeq = Number.isInteger(beforeSeqRaw) && beforeSeqRaw > 0 ? beforeSeqRaw : null;
+                try {
+                    const history = await readSessionHistory(sessionId, limit, beforeSeq);
+                    return sendJson(res, 200, history);
+                } catch (error) {
+                    log(`读取会话历史失败 session=${sessionId}: ${error.message}`);
+                    if (isSessionNotFoundError(error)) return sendJson(res, 404, { error: `会话不存在: ${sessionId}` });
+                    const message = error && error.name === 'AbortError' ? '读取会话历史超时' : error.message;
+                    return sendJson(res, 500, { error: message });
+                }
+            }
+
+            if (req.method === 'GET' && url.pathname === '/events') {
+                const sessionId = url.searchParams.get('sessionId') || '';
+                const sinceSeqRaw = Number(url.searchParams.get('sinceSeq'));
+                const sinceSeq = Number.isInteger(sinceSeqRaw) && sinceSeqRaw > 0 ? sinceSeqRaw : 0;
+                const events = bridgeEvents.filter((item) => item.seq > sinceSeq && (!sessionId || item.sessionId === sessionId));
+                let cursor = sinceSeq;
+                for (const item of events) {
+                    if (item.seq > cursor) cursor = item.seq;
+                }
+                return sendJson(res, 200, { sessionId: sessionId || null, cursor, events });
+            }
+
             if (req.method === 'POST' && url.pathname === '/sessions/operate') {
                 const body = JSON.parse(await readBody(req));
                 const sessionId = body.sessionId;
@@ -803,14 +1472,7 @@ export function apply(ctx, pluginConfig) {
                     return sendJson(res, 400, { error: '这是机器人自己的会话，请用任务工具操作' });
                 }
                 if (body.action === 'prompt') {
-                    const requestId = `qq-req-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`;
-                    const controller = new AbortController();
-                    await ctx.sessionController.prompt({
-                        requestId,
-                        sessionId,
-                        mode: 'queue',
-                        content: [{ type: 'text', text: body.prompt || '请继续处理当前任务。' }]
-                    }, controller.signal);
+                    await submitPrompt(sessionId, body.prompt || '请继续处理当前任务。', 'queue');
                     log(`已向会话 ${sessionId} 发送提示`);
                     return sendJson(res, 200, { ok: true, sessionId });
                 }

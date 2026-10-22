@@ -19,6 +19,7 @@ function defaultConfig() {
         provider: '',
         model: '',
         stateFile: path.join(dataDir, 'state.json'),
+        reportsFile: path.join(dataDir, 'pending-reports.json'),
         logFile: path.join(dataDir, 'bridge.log'),
         astrbotLogFile: path.join(dataDir, 'astrbot.log'),
         installDir: path.join(dataDir, 'downloads'),
@@ -70,6 +71,7 @@ function normalizeConfig(config, defaults) {
     if (!config.workspace) config.workspace = defaults.workspace;
     if (!config.dshHome) config.dshHome = defaults.dshHome;
     if (!config.stateFile) config.stateFile = defaults.stateFile;
+    if (!config.reportsFile) config.reportsFile = defaults.reportsFile;
     if (!config.logFile) config.logFile = defaults.logFile;
     if (!config.astrbotLogFile) config.astrbotLogFile = defaults.astrbotLogFile;
     if (!config.installDir) config.installDir = defaults.installDir;

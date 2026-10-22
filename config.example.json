@@ -5,6 +5,7 @@
   "provider": "deepseek-official",
   "model": "deepseek-flash",
   "stateFile": "D:\\path\\to\\your\\dsh-chatbot-bridge\\state.json",
+  "reportsFile": "D:\\path\\to\\your\\dsh-chatbot-bridge\\pending-reports.json",
   "logFile": "D:\\path\\to\\your\\dsh-chatbot-bridge\\bridge.log",
   "astrbotLogFile": "D:\\path\\to\\your\\dsh-chatbot-bridge\\astrbot.log",
   "installDir": "D:\\path\\to\\your\\dsh-chatbot-bridge\\downloads",

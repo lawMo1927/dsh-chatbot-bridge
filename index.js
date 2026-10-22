@@ -240,7 +240,7 @@ export function apply(ctx, pluginConfig) {
     const config = { ...loadConfig(), ...(pluginConfig || {}) };
     ensureConfigDirs(config);
     const log = createLogger(config.logFile);
-    const manager = new TaskManager(config.workspace);
+    const manager = new TaskManager(config.workspace, config.reportsFile);
     const pendingApprovals = new Map();
     const approvalHistory = [];
     const recentToolCalls = new Map();

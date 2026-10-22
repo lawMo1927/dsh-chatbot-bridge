@@ -7,8 +7,9 @@ const MAX_ARTIFACT_BYTES = 50 * 1024 * 1024;
 const MAX_TASK_IDS_PER_SESSION = 50;
 
 export class TaskManager {
-    constructor(workspace) {
+    constructor(workspace, reportsFile = '') {
         this.workspace = workspace;
+        this.reportsFile = reportsFile;
         this.tasks = new Map();
         this.queue = [];
         this.pendingReports = new Map();
@@ -17,6 +18,35 @@ export class TaskManager {
         this.sessionTitles = new Map();
         this.assistantTextBySession = new Map();
         this.sessionId = null;
+        this.loadReports();
+    }
+
+    loadReports() {
+        if (!this.reportsFile) return;
+        let raw;
+        try {
+            raw = fs.readFileSync(this.reportsFile, 'utf8');
+        } catch (error) {
+            if (error.code === 'ENOENT') return;
+            throw error;
+        }
+        const reports = JSON.parse(raw);
+        if (!Array.isArray(reports)) throw new Error(`待回传报告文件格式错误: ${this.reportsFile}`);
+        for (const report of reports) {
+            if (!report || typeof report !== 'object' || !report.taskId) continue;
+            this.pendingReports.set(String(report.taskId), report);
+        }
+    }
+
+    saveReports() {
+        if (!this.reportsFile) return;
+        const temporary = `${this.reportsFile}.tmp`;
+        fs.writeFileSync(
+            temporary,
+            JSON.stringify(Array.from(this.pendingReports.values()), null, 2),
+            'utf8'
+        );
+        fs.renameSync(temporary, this.reportsFile);
     }
 
     setSession(sessionId) {
@@ -201,6 +231,7 @@ export class TaskManager {
             files,
             sessionTitle
         });
+        this.saveReports();
         this.assistantTextBySession.delete(task.sessionId);
         return task;
     }
@@ -242,6 +273,7 @@ export class TaskManager {
         for (const id of taskIds || []) {
             this.pendingReports.delete(id);
         }
+        this.saveReports();
     }
 
     getTask(taskId) {

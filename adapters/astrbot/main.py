@@ -10,7 +10,7 @@ from astrbot.api import logger, star
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.message_components import File, Plain
 from astrbot.api.provider import ProviderRequest
-from astrbot.core.message.message_event_result import MessageChain
+from astrbot.core.message.message_event_result import MessageChain, ResultContentType
 from astrbot.core.platform.message_type import MessageType
 
 BRIDGE_URL = "http://127.0.0.1:9412"
@@ -323,6 +323,8 @@ class Main(star.Star):
         if not task_id:
             return f"桥接服务返回的内容缺少任务编号，无法确认提交结果：{result}"
         target_session = result.get("sessionId") or session_id or "桥接会话"
+        # 任务回执包含完整提示词，标记为单条消息，避免被分段回复拆开
+        event.set_extra("dsh_single_message", True)
         if (result.get("mode") or mode) == "steer":
             return (
                 f"已向正在执行的任务追加指令（任务编号 {task_id}，会话 {target_session}）。"
@@ -613,6 +615,7 @@ class Main(star.Star):
         new_task_id = result.get("taskId")
         if not new_task_id:
             return f"桥接服务返回的内容缺少任务编号，无法确认提交结果：{result}"
+        event.set_extra("dsh_single_message", True)
         session_id = result.get("sessionId")
         suffix = f"，会话 {session_id}" if session_id else ""
         return (
@@ -934,6 +937,25 @@ class Main(star.Star):
         if len(text) > 12000:
             text = text[:12000] + "\n……（输出过长已截断）"
         return text
+
+    @filter.on_decorating_result()
+    async def on_decorating_result(self, event: AstrMessageEvent) -> None:
+        if not event.get_extra("dsh_single_message"):
+            return
+        result = event.get_result()
+        if not result or not result.chain:
+            return
+        text_parts = []
+        other_parts = []
+        for component in result.chain:
+            if isinstance(component, Plain):
+                text_parts.append(component.text)
+            else:
+                other_parts.append(component)
+        merged = "".join(part for part in text_parts if part)
+        if merged:
+            result.chain = [Plain(merged)] + other_parts
+        result.set_result_content_type(ResultContentType.GENERAL_RESULT)
 
     @filter.on_llm_request()
     async def on_llm_request(self, event: AstrMessageEvent, req: ProviderRequest) -> None:

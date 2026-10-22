@@ -1321,9 +1321,6 @@ window.__ModuleLoader__.load({
                     "div",
                     { style: styles.card },
                     react.createElement("div", { style: styles.label }, "第一次使用"),
-                    react.createElement("div", { style: { color: "var(--dsw-alias-label-secondary)", fontSize: "13px", lineHeight: "1.8" } },
-                        "插件不会要求你在这里填写 AstrBot 的账号密码。登录、模型供应商、人格和平台连接都在 AstrBot 自己的网页里完成。"
-                    ),
                     setupStatus
                         ? react.createElement("div", { style: { color: "var(--dsw-alias-label-secondary)", fontSize: "12px", marginTop: "8px" } },
                             setupStatus.online

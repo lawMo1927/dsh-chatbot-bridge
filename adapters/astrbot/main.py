@@ -1114,6 +1114,15 @@ class Main(star.Star):
             f"工具：{tool}",
             f"原因：{reason}",
         ]
+        command = str(item.get("command") or "").strip()
+        if command:
+            lines.append("命令：" + self._truncate_text(command, 1200).replace("\n", "\n  "))
+        created_at = item.get("createdAt")
+        if created_at:
+            lines.append(f"发起时间：{self._format_time(created_at)}")
+            elapsed = self._elapsed_ms(created_at)
+            if elapsed is not None:
+                lines.append(f"已等待：{self._format_duration(elapsed)}")
         if item.get("sessionId"):
             lines.append(f"会话：{item.get('sessionId')}")
         if item.get("taskId"):

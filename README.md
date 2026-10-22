@@ -29,6 +29,16 @@ DSH 插件：一站式聊天机器人桥接器。装在 DSH 里，侧边栏多�
 
 审批支持双通道应答。待审批项推送会带审批编号、工具、命令、原因、会话、任务与等待时间；同时有多项时，管理员可以回复「允许 审批编号」或「拒绝 审批编号」精确处理某一项。
 
+## 环境要求
+
+- Windows 10 或 Windows 11。进程管理、安装、二维码链路依赖 PowerShell 与 Windows 进程接口。
+- 已安装 DSH。
+- AstrBot 4.x、NapCat、QQ 客户端。
+- 一个管理员 QQ 号，以及可用的模型供应商与 API Key。
+- 首次安装 uv、AstrBot、NapCat 或生成二维码时需要网络。
+
+插件不会自动安装 QQ 客户端，也不会替用户创建 AstrBot WebUI 账号或配置 NapCat 的 OneBot 连接。
+
 ## 安装
 
 ### 方式一：从 npm 安装
@@ -65,32 +75,40 @@ pnpm add dsh-chatbot-bridge
 
 ## 配置
 
-复制 `config.example.json` 为 `config.json`，按注释修改路径与凭据。`config.json` 不进版本库，安装包也不带；从 npm 或市场安装时，配置文件要放在插件安装目录（DSH profile 的 `node_modules/dsh-chatbot-bridge`）下，首次启动 DSH 之前创建好。
+首次启动 DSH 时，如果插件目录和 DSH 数据目录都没有 `config.json`，插件会在 DSH 数据目录（默认 `C:\Users\<名字>\.dsh\chatbot-bridge\config.json`）生成一份默认配置，并创建默认工作区、日志目录与安装目录。插件目录里的 `config.json` 优先使用，方便本地目录安装；从 npm 或市场安装时使用 DSH 数据目录里的配置。
+
+默认工作区是用户主目录下的 `dsh-chatbot-workspace`；AstrBot 与 NapCat 路径默认为空，需要用户在面板「安装」页填写，或使用环境检测得到的路径。
+
+也可以复制 `config.example.json` 到上述任一位置后手动修改。`config.json` 不随包安装，面板的「进程」页和「安装」页会回写其中的常用字段。
 
 | 字段 | 说明 |
 |---|---|
 | `port` | 桥接服务端口，默认 9412，聊天插件通过它调用桥接 |
 | `workspace` | 机器人执行任务的工作目录，也是会话的 cwd |
 | `dshHome` | DSH 数据目录，默认 `C:\Users\<名字>\.dsh` |
-| `adminQQ` | 管理员 QQ 号，机器人只响应这个号码发起的任务 |
+| `adminQQ` | 管理员 QQ 号，机器人只响应这个号码发起的任务；默认留空，在面板「进程」页填写 |
 | `astrbot` | AstrBot 的安装目录、启动 exe、WebUI 地址与登录凭据 |
 | `napcat` | NapCat 的 WebUI 地址、token、安装目录与启动脚本 |
-| `pythonExe` `qrScript` | 二维码图片生成所需的 Python 与脚本 |
 | `qqPath` | QQ 客户端路径，用于检测是否已安装 |
 
 `adminQQ` 可以在面板的「进程」页顶部直接填写保存，不需要手动改文件。
 
+二维码图片由插件的 Node 依赖 `qrcode` 生成，不需要 Python 脚本；通过 npm 或 pnpm 安装插件时会自动安装该依赖。
+
 ## 首次配置
 
-装好插件后按下面的顺序配置：
+装好插件并重启 DSH 后按下面的顺序配置：
 
-1. 「进程」页顶部填管理员 QQ，保存
-2. 「模型与 API」页配置供应商的 API 地址与 Key，选择当前模型
-3. 「人格」页编辑人格，可以点「载入默认模板」从通用模板开始改
-4. 「安装」页确认环境组件齐全，点「安装」把桥接插件装进 AstrBot
-5. 「进程」页启动聊天机器人与 NapCat，扫码登录 QQ
+1. 打开「聊天机器人」面板。首次启动会自动生成 `config.json`。
+2. 「进程」页顶部确认管理员 QQ 与工作区路径，保存。
+3. 「安装」页填写 AstrBot 目录与启动程序、NapCat 目录与启动脚本；环境检测通过后安装缺失的 uv、AstrBot、NapCat。
+4. 如果 AstrBot 是全新安装，先在 AstrBot 自己的 WebUI 完成首次账号设置，再把账号密码填进面板「安装」页的高级设置。
+5. 「模型与 API」页配置供应商的 API 地址与 Key，选择当前模型。
+6. 「安装」页点「安装」把桥接适配器装进 AstrBot。
+7. 「进程」页启动聊天机器人与 NapCat，获取二维码并扫码登录 QQ。
+8. 「人格」页选择或创建人格，可点「载入默认模板」从通用模板开始改。
 
-管理员保存和 AstrBot 插件安装都需要重启聊天机器人生效。
+管理员保存和 AstrBot 适配器安装都需要重启聊天机器人生效。AstrBot 是否启用当前人格由 AstrBot 自己的配置决定，面板只负责编辑人格内容。
 
 ## 默认人格
 
@@ -122,15 +140,15 @@ DSH 的越权操作（工作区外读写、提权命令）会经过审批。本�
 插件把任务桥接入口暴露为 HTTP 服务（默认 9412），聊天机器人侧需要一个适配器调用它。目前提供 AstrBot 适配器：
 
 - 适配器代码在仓库 `adapters/astrbot`，面板「安装」页可以一键复制到 AstrBot 插件目录
-- 接口约定：`POST /task` 提交，`GET /reports` 拉取结果，`POST /approval/answer` 应答审批，`POST /progress` 询问进度，`GET /sessions` 列会话
+- 当前接口包括：`POST /task`、`GET /tasks`、`GET /tasks/:id`、`POST /tasks/:id/cancel`、`POST /tasks/:id/continue`、`POST /prompt`、`GET /sessions`、`GET /sessions/:id/history`、`GET /reports`、`POST /reports/ack`、`GET /approvals`、`POST /approval/answer`、`GET /events`、`GET /events/stream`；旧接口 `/task/cancel`、`/task/continue`、`/task/:id`、`/progress`、`/sessions/operate` 继续保留
 
 ## 工作区归属
 
-插件创建或恢复会话后，自动把会话归入 cwd 匹配的工作区。历史会话可用 `POST /admin/sessions/attach` 补登记。
+插件创建或恢复会话后，会按 cwd 查找 DSH 已登记的工作区并归入。用户需要先在 DSH 里登记与 `config.workspace` 相同路径的工作区；没有登记时会话仍可创建，但不会归入工作区。历史会话可用 `POST /admin/sessions/attach` 补登记。
 
 ## 常见问题
 
-**QQ 二维码获取失败**：先确认 NapCat 在运行（6099 端口），且 `config.json` 里的 token 正确。
+**QQ 二维码获取失败**：先确认 NapCat 在运行（6099 端口），且 `config.json` 里的 token 正确。二维码图片由 Node 依赖生成；如果依赖没有安装，先重新执行 `pnpm install`。
 
 **审批没有出现在聊天里**：检查 DSH 页面是否打开着且正在等待页面应答；或应用可选补丁。
 

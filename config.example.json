@@ -10,9 +10,7 @@
   "installDir": "D:\\path\\to\\your\\dsh-chatbot-bridge\\downloads",
   "taskTimeoutMinutes": 60,
   "approvalTimeoutSeconds": 300,
-  "pythonExe": "C:\\Users\\YOURNAME\\AppData\\Local\\Python\\pythoncore-3.14-64\\python.exe",
-  "qrScript": "D:\\path\\to\\your\\tools\\gen-qrcode.py",
-  "qrImageFile": "D:\\path\\to\\your\\dsh-chatbot-bridge\\qrcode.png",
+  "adminQQ": "",
   "qqPath": "C:\\Program Files\\Tencent\\QQNT\\QQ.exe",
   "astrbot": {
     "dir": "D:\\path\\to\\astrbot",

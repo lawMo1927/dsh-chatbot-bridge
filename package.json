@@ -1,6 +1,6 @@
 {
   "name": "dsh-chatbot-bridge",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "DSH 插件：一站式聊天机器人桥接器。在 DSH 侧边栏管理聊天机器人进程、派发任务、双通道审批，让机器人真正会干活。",
   "type": "module",
   "main": "index.js",
@@ -42,6 +42,7 @@
   "files": [
     "index.js",
     "client.js",
+    "config.js",
     "tasks.js",
     "adapters",
     "templates",
@@ -50,5 +51,8 @@
     "README.md",
     "docs",
     "LICENSE"
-  ]
+  ],
+  "dependencies": {
+    "qrcode": "^1.5.4"
+  }
 }

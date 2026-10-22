@@ -6,17 +6,14 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { spawn, execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import QRCode from 'qrcode';
 import { TaskManager } from './tasks.js';
+import { ensureConfigDirs, getConfigFile, loadConfig } from './config.js';
 
 export const name = 'dsh-chatbot-bridge';
 export const inject = ['sessionController', 'sessions', 'agents', 'approval', 'workspaceRegistry'];
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-
-function loadConfig() {
-    const file = path.join(__dirname, 'config.json');
-    return JSON.parse(fs.readFileSync(file, 'utf8'));
-}
 
 function createLogger(logFile) {
     return (message) => {
@@ -241,6 +238,7 @@ function isSessionNotFoundError(error) {
 
 export function apply(ctx, pluginConfig) {
     const config = { ...loadConfig(), ...(pluginConfig || {}) };
+    ensureConfigDirs(config);
     const log = createLogger(config.logFile);
     const manager = new TaskManager(config.workspace);
     const pendingApprovals = new Map();
@@ -1700,14 +1698,16 @@ export function apply(ctx, pluginConfig) {
                     astrbotDir: config.astrbot.dir,
                     astrbotExe: config.astrbot.exe,
                     napcatWebui: config.napcat.webui,
-                    napcatToken: config.napcat.token
+                    napcatToken: config.napcat.token,
+                    napcatDir: config.napcat.dir,
+                    napcatLauncher: config.napcat.launcher
                 });
             }
 
             if (req.method === 'POST' && url.pathname === '/admin/settings') {
                 try {
                     const body = JSON.parse(await readBody(req));
-                    const configFile = path.join(__dirname, 'config.json');
+                    const configFile = getConfigFile();
                     const data = JSON.parse(fs.readFileSync(configFile, 'utf8'));
                     if (typeof body.adminQQ === 'string') {
                         config.adminQQ = body.adminQQ.trim();
@@ -1739,6 +1739,16 @@ export function apply(ctx, pluginConfig) {
                         data.napcat.token = config.napcat.token;
                         log(`NapCat token 已更新`);
                     }
+                    if (typeof body.napcatDir === 'string' && body.napcatDir.trim()) {
+                        config.napcat.dir = body.napcatDir.trim();
+                        data.napcat.dir = config.napcat.dir;
+                        log(`NapCat 目录已更新: ${config.napcat.dir}`);
+                    }
+                    if (typeof body.napcatLauncher === 'string' && body.napcatLauncher.trim()) {
+                        config.napcat.launcher = body.napcatLauncher.trim();
+                        data.napcat.launcher = config.napcat.launcher;
+                        log(`NapCat 启动脚本已更新: ${config.napcat.launcher}`);
+                    }
                     fs.writeFileSync(configFile, JSON.stringify(data, null, 2), 'utf8');
                     return sendJson(res, 200, {
                         ok: true,
@@ -1747,7 +1757,9 @@ export function apply(ctx, pluginConfig) {
                         astrbotDir: config.astrbot.dir,
                         astrbotExe: config.astrbot.exe,
                         napcatWebui: config.napcat.webui,
-                        napcatToken: config.napcat.token
+                        napcatToken: config.napcat.token,
+                        napcatDir: config.napcat.dir,
+                        napcatLauncher: config.napcat.launcher
                     });
                 } catch (error) {
                     log(`保存设置失败: ${error.message}`);
@@ -1842,8 +1854,12 @@ export function apply(ctx, pluginConfig) {
                 }
                 if (!qr.link) return sendJson(res, 404, qr);
                 try {
-                    execFileSync(config.pythonExe, [config.qrScript, qr.link, config.qrImageFile], { timeout: 20000 });
-                    const png = fs.readFileSync(config.qrImageFile);
+                    const png = await QRCode.toBuffer(qr.link, {
+                        type: 'png',
+                        width: 320,
+                        margin: 1,
+                        errorCorrectionLevel: 'M'
+                    });
                     res.writeHead(200, { 'Content-Type': 'image/png', 'Access-Control-Allow-Origin': '*' });
                     return res.end(png);
                 } catch (error) {

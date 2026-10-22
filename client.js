@@ -133,7 +133,7 @@ window.__ModuleLoader__.load({
             const [env, setEnv] = react.useState(null);
             const [adminQQ, setAdminQQ] = react.useState("");
             const [workspace, setWorkspace] = react.useState("");
-            const [advanced, setAdvanced] = react.useState({ astrbotDir: "", astrbotExe: "", napcatWebui: "", napcatToken: "" });
+            const [advanced, setAdvanced] = react.useState({ astrbotDir: "", astrbotExe: "", napcatWebui: "", napcatToken: "", napcatDir: "", napcatLauncher: "" });
             const [starting, setStarting] = react.useState(false);
             const [settingsLoaded, setSettingsLoaded] = react.useState(false);
 
@@ -268,7 +268,9 @@ window.__ModuleLoader__.load({
                         astrbotDir: data.astrbotDir || "",
                         astrbotExe: data.astrbotExe || "",
                         napcatWebui: data.napcatWebui || "",
-                        napcatToken: data.napcatToken || ""
+                        napcatToken: data.napcatToken || "",
+                        napcatDir: data.napcatDir || "",
+                        napcatLauncher: data.napcatLauncher || ""
                     });
                     setSettingsLoaded(true);
                 } catch (err) {
@@ -1114,6 +1116,18 @@ window.__ModuleLoader__.load({
                         type: "password",
                         value: advanced.napcatToken,
                         onChange: (event) => setAdvanced({ ...advanced, napcatToken: event.target.value })
+                    }),
+                    react.createElement("div", { style: { ...styles.label, marginTop: "10px" } }, "NapCat 目录"),
+                    react.createElement("input", {
+                        style: styles.input,
+                        value: advanced.napcatDir,
+                        onChange: (event) => setAdvanced({ ...advanced, napcatDir: event.target.value })
+                    }),
+                    react.createElement("div", { style: { ...styles.label, marginTop: "10px" } }, "NapCat 启动脚本"),
+                    react.createElement("input", {
+                        style: styles.input,
+                        value: advanced.napcatLauncher,
+                        onChange: (event) => setAdvanced({ ...advanced, napcatLauncher: event.target.value })
                     }),
                     react.createElement(
                         "div",

@@ -127,7 +127,7 @@ function summarizeSessionEvent(event) {
                 role: 'assistant',
                 source: 'dsh',
                 kind: 'text',
-                text: truncateText(messageText(data.message), MAX_EVENT_TEXT_CHARS),
+                text: truncateText(naturalMessageText(data.message), MAX_EVENT_TEXT_CHARS),
                 turn: data.turn,
                 step: data.step
             }

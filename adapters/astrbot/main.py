@@ -1235,12 +1235,20 @@ class Main(star.Star):
                     for item in reports:
                         task_id = str(item.get("taskId") or "")
                         steer_state = self._steer_tasks.get(task_id)
-                        skip_text = bool(steer_state and steer_state.get("pushed"))
+                        raw_text = str(item.get("text") or "")
+                        pushed_text = str(steer_state.get("text") or "") if steer_state else ""
+                        # 只跳过与实时推送完全相同的文本；最终答复不同时仍要发送
+                        skip_text = bool(
+                            steer_state
+                            and steer_state.get("pushed")
+                            and pushed_text.strip()
+                            and raw_text.strip() == pushed_text.strip()
+                        )
                         files = item.get("files") or []
                         umo = item.get("umo") or f"napcat:FriendMessage:{self._admin_qq}"
                         file_umo = item.get("fileUmo") or umo
                         title = str(item.get("sessionTitle") or "")
-                        text = item.get("text") or ""
+                        text = raw_text
                         if title:
                             text = f"（转发自DSH会话：{title}）\n\n{text}"
                         ok = True
@@ -1349,6 +1357,7 @@ class Main(star.Star):
             return
         data = item.get("data")
         text = str(data.get("text") or "").strip() if isinstance(data, dict) else ""
+        text = self._clean_live_text(text)
         if not text:
             return
         umo = str(state.get("umo") or "")
@@ -1370,6 +1379,16 @@ class Main(star.Star):
             "files": [],
         })
         logger.info(f"dsh_bridge 已实时推送 steer 回复：{task_id}")
+
+    @staticmethod
+    def _clean_live_text(text: str) -> str:
+        kept = []
+        for line in text.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("（调用工具") and stripped.endswith("）"):
+                continue
+            kept.append(line)
+        return "\n".join(kept).strip()
 
     def _expire_steer_tasks(self) -> None:
         now = datetime.datetime.now().timestamp()

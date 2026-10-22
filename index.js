@@ -203,6 +203,7 @@ function historyMessage(record) {
     if (event.type === 'user/message') {
         const message = data.message || data;
         const source = classifyUserSource(message.source);
+        if (source === 'system') return null;
         const text = naturalMessageText(message);
         if (!text) return null;
         return {
@@ -210,7 +211,7 @@ function historyMessage(record) {
             time: event.time,
             role: 'user',
             source,
-            kind: source === 'system' ? 'status' : 'prompt',
+            kind: 'prompt',
             text: truncateText(text, MAX_MESSAGE_TEXT_CHARS)
         };
     }
@@ -740,11 +741,28 @@ export function apply(ctx, pluginConfig) {
         return detail;
     }
 
+    async function pageHistory(address, throughSeq, beforeSeq, pageSize) {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), 10000);
+        try {
+            return await ctx.sessionController.page({
+                address,
+                throughSeq,
+                beforeSeq,
+                maxMessages: pageSize
+            }, controller.signal);
+        } finally {
+            clearTimeout(timer);
+        }
+    }
+
     async function readSessionHistory(sessionId, limit, beforeSeq) {
         const address = { kind: 'session', sessionId };
+        const wanted = Math.max(1, Math.min(Number(limit) || 20, 100));
+        const pageSize = Math.min(Math.max(wanted * 5, 50), 200);
         const streamController = new AbortController();
         const streamTimer = setTimeout(() => streamController.abort(), 15000);
-        const stream = ctx.sessionController.follow({ address, maxMessages: limit }, streamController.signal);
+        const stream = ctx.sessionController.follow({ address, maxMessages: pageSize }, streamController.signal);
         const iterator = stream[Symbol.asyncIterator]();
         let snapshot;
         try {
@@ -759,41 +777,38 @@ export function apply(ctx, pluginConfig) {
             await iterator.return();
         }
 
+        const cursor = snapshot.cursor;
         let records = snapshot.records || [];
         let hasMore = Boolean(snapshot.hasMore);
         if (beforeSeq !== null) {
-            const pageController = new AbortController();
-            const pageTimer = setTimeout(() => pageController.abort(), 10000);
-            try {
-                const page = await ctx.sessionController.page({
-                    address,
-                    throughSeq: snapshot.cursor,
-                    beforeSeq,
-                    maxMessages: limit
-                }, pageController.signal);
-                records = page.records || [];
-                hasMore = Boolean(page.hasMore);
-            } finally {
-                clearTimeout(pageTimer);
-            }
+            const page = await pageHistory(address, cursor, beforeSeq, pageSize);
+            records = page.records || [];
+            hasMore = Boolean(page.hasMore);
+        }
+        let messages = records.map(historyMessage).filter(Boolean);
+
+        // 过滤掉工具事件后可能不足 limit，继续向前翻页补足
+        while (messages.length < wanted && hasMore) {
+            const oldestSeq = records.length && records[0].event ? records[0].event.seq : null;
+            if (!Number.isInteger(oldestSeq)) break;
+            const page = await pageHistory(address, cursor, oldestSeq, pageSize);
+            const olderRecords = page.records || [];
+            const nextOldestSeq = olderRecords.length && olderRecords[0].event ? olderRecords[0].event.seq : null;
+            hasMore = Boolean(page.hasMore);
+            const older = olderRecords.map(historyMessage).filter(Boolean);
+            if (!older.length && !hasMore) break;
+            messages = older.concat(messages);
+            records = olderRecords;
+            if (!Number.isInteger(nextOldestSeq) || nextOldestSeq >= oldestSeq) break;
         }
 
-        const messages = [];
-        for (const record of records) {
-            const message = historyMessage(record);
-            if (message) messages.push(message);
-        }
         messages.sort((a, b) => a.seq - b.seq);
-        let result = messages;
-        if (result.length > limit) {
-            hasMore = true;
-            result = result.slice(result.length - limit);
-        }
+        const result = messages.slice(-wanted);
         return {
             sessionId,
-            cursor: snapshot.cursor,
+            cursor,
             order: 'ascending',
-            hasMore,
+            hasMore: hasMore || messages.length > result.length,
             messages: result
         };
     }

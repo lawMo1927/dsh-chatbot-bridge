@@ -1,3 +1,4 @@
+import ast
 import asyncio
 import datetime
 import json
@@ -934,31 +935,195 @@ class Main(star.Star):
             )
         return chunk
 
-    @filter.llm_tool(name="read_own_sent_messages")
-    async def read_own_sent_messages(
+    @filter.llm_tool(name="read_chat_messages")
+    async def read_chat_messages(
         self,
         event: AstrMessageEvent,
+        action: str = "all",
+        limit: int = 20,
         index: int = 0,
         task_id: str = "",
         keyword: str = "",
         full: bool = False,
     ) -> str:
-        """读取机器人自己最近发送给用户的内容，包括从 DSH 转发的任务结果与文件。
-        当用户询问“刚才发的/之前发的结果或文件是什么”“结果有没有发出去”，
-        或者需要确认自己已经推送过的内容时调用；必要时可以强制读取完整内容与文件文本。
+        """读取当前聊天记录与机器人自己最近发送的内容，包括从 DSH 回传的任务结果和文件。
+        用户询问“我们刚才聊了什么”“你之前发了什么”“DSH 的结果有没有回来”时调用；
+        默认会同时返回当前聊天记录和机器人自己的发送记录。
 
         Args:
-            index(int): 读取倒数第几条发送记录，1 表示最近一条，0 表示默认最近一条。
-            task_id(string): 按 DSH 任务编号筛选，例如 task_1792586133760_731。
-            keyword(string): 按文本内容或文件名筛选。
-            full(bool): 是否返回完整文本；为 true 时文本不截断，并尝试读取工作区内文本文件的内容。
+            action(string): all 同时读取聊天与发送记录；chat 只读当前聊天；sent 只读自己的发送记录。
+            limit(int): 当前聊天返回的最近消息条数，默认 20，最多 50。
+            index(int): sent 动作中读取倒数第几条发送记录，1 表示最近一条，0 表示默认。
+            task_id(string): 按 DSH 任务编号筛选发送记录。
+            keyword(string): 按发送文本或文件名筛选发送记录。
+            full(bool): 发送记录是否返回完整文本；为 true 时尝试读取工作区内文本文件内容。
         """
         if not self._allowed(event):
             return "这个功能仅限管理员使用。"
+        action_value = (action or "all").strip().lower()
+        if action_value not in ("all", "chat", "sent"):
+            return "action 只支持 all、chat、sent。"
+        try:
+            limit_value = max(1, min(int(limit or 20), 50))
+        except (TypeError, ValueError):
+            limit_value = 20
+        lines = []
+        if action_value in ("all", "chat"):
+            lines.extend(await self._chat_history_lines(event, limit_value))
+        if action_value in ("all", "sent"):
+            lines.append(
+                await self._sent_history_lines(
+                    index=index,
+                    task_id=task_id,
+                    keyword=keyword,
+                    full=full,
+                    compact=action_value == "all",
+                )
+            )
+        text = "\n\n".join(line for line in lines if line)
+        if not text:
+            return "没有读到当前聊天记录或发送记录。"
+        if len(text) > 12000:
+            text = text[:12000] + "\n……（输出过长已截断）"
+        return text
+
+    async def _chat_history_lines(
+        self, event: AstrMessageEvent, limit: int
+    ) -> list[str]:
+        messages = []
+        source = ""
+        try:
+            manager = getattr(self.context, "conversation_manager", None)
+            if manager is not None:
+                conversation_id = await manager.get_curr_conversation_id(
+                    event.unified_msg_origin
+                )
+                if conversation_id:
+                    conversation = await manager.get_conversation(
+                        event.unified_msg_origin, conversation_id
+                    )
+                    if conversation is not None and conversation.history:
+                        raw = conversation.history
+                        if isinstance(raw, str):
+                            raw = json.loads(raw)
+                        if isinstance(raw, list):
+                            for item in raw:
+                                if not isinstance(item, dict):
+                                    continue
+                                role = str(item.get("role") or "").strip()
+                                if role not in ("user", "assistant"):
+                                    continue
+                                body = self._chat_content_text(item.get("content"))
+                                if body:
+                                    messages.append((role, body))
+                            if messages:
+                                source = "当前对话"
+        except Exception as error:
+            logger.warning(f"dsh_bridge 读取当前对话历史失败: {error}")
+        if not messages:
+            try:
+                manager = getattr(self.context, "message_history_manager", None)
+                if manager is not None:
+                    records = await manager.get(
+                        platform_id=event.get_platform_id(),
+                        user_id=event.unified_msg_origin,
+                        page=1,
+                        page_size=limit,
+                    )
+                    for record in records:
+                        content = record.content if isinstance(record.content, dict) else {}
+                        role = str(content.get("type") or "user").strip()
+                        if role not in ("user", "bot", "assistant"):
+                            continue
+                        normalized_role = "assistant" if role in ("bot", "assistant") else "user"
+                        body = self._chat_parts_text(
+                            content.get("message") or content.get("content") or []
+                        )
+                        if not body:
+                            body = self._chat_content_text(content)
+                        if body:
+                            messages.append((normalized_role, body))
+                    if messages:
+                        source = "平台消息记录"
+            except Exception as error:
+                logger.warning(f"dsh_bridge 读取平台消息历史失败: {error}")
+        if not messages:
+            return ["当前聊天没有可用的历史记录。"]
+        selected = messages[-limit:]
+        lines = [f"当前聊天最近 {len(selected)} 条记录（{source}）："]
+        for role, body in selected:
+            label = "用户" if role == "user" else "机器人"
+            lines.append(f"{label}：\n{body}")
+        return ["\n".join(lines)]
+
+    def _chat_content_text(self, content) -> str:
+        if isinstance(content, str):
+            stripped = content.strip()
+            if not stripped:
+                return ""
+            if stripped.startswith("["):
+                parsed = None
+                try:
+                    parsed = json.loads(stripped)
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    try:
+                        parsed = ast.literal_eval(stripped)
+                    except (ValueError, SyntaxError):
+                        parsed = None
+                if isinstance(parsed, list):
+                    return self._chat_parts_text(parsed)
+            return self._clean_chat_text(stripped)
+        if isinstance(content, list):
+            return self._chat_parts_text(content)
+        if isinstance(content, dict):
+            return self._chat_parts_text([content])
+        return ""
+
+    def _chat_parts_text(self, parts) -> str:
+        texts = []
+        for part in parts if isinstance(parts, list) else []:
+            if isinstance(part, str):
+                text = part
+            elif isinstance(part, dict):
+                part_type = str(part.get("type") or "")
+                if part_type in ("think", "reasoning"):
+                    continue
+                if part_type == "at":
+                    name = str(part.get("name") or part.get("user_id") or "")
+                    text = f"@{name}" if name else "@某人"
+                elif part_type in ("image", "record", "video", "file"):
+                    text = f"[{part_type}]"
+                else:
+                    value = part.get("text")
+                    text = str(value) if value is not None else ""
+            else:
+                continue
+            cleaned = self._clean_chat_text(text)
+            if cleaned:
+                texts.append(cleaned)
+        return "\n".join(texts)
+
+    @staticmethod
+    def _clean_chat_text(text) -> str:
+        lines = []
+        for line in str(text or "").splitlines():
+            if "<system_reminder>" in line or "Current datetime:" in line:
+                continue
+            lines.append(line)
+        return "\n".join(lines).strip()
+
+    async def _sent_history_lines(
+        self,
+        index: int = 0,
+        task_id: str = "",
+        keyword: str = "",
+        full: bool = False,
+        compact: bool = False,
+    ) -> str:
         async with self._sent_history_lock:
             records = list(self._sent_history)
         if not records:
-            return "最近没有发送过内容。"
+            return "机器人最近没有发送过内容。"
         selected = []
         if task_id:
             selected = [item for item in records if task_id in str(item.get("taskId") or "")]
@@ -974,17 +1139,16 @@ class Main(star.Star):
         elif index and index > 0:
             if index <= len(records):
                 selected = [records[-index]]
+        elif compact:
+            selected = records[-3:]
         else:
             selected = [records[-1]]
         if not selected:
             return "没有找到匹配的发送记录。"
-        lines = [f"共 {len(records)} 条发送记录，以下为匹配结果："]
+        lines = [f"机器人最近发送记录（共 {len(records)} 条，以下为匹配结果）："]
         for item in selected:
             lines.append(self._format_sent_record(records, item, full))
-        text = "\n\n".join(lines)
-        if len(text) > 12000:
-            text = text[:12000] + "\n……（输出过长已截断）"
-        return text
+        return "\n\n".join(lines)
 
     @filter.on_decorating_result()
     async def on_decorating_result(self, event: AstrMessageEvent) -> None:
@@ -1027,7 +1191,7 @@ class Main(star.Star):
             "\n\nDSH 桥接规则：\n"
             "1. 本插件只提供 5 个 DSH 工具：dsh_session（会话列表、状态、历史、提示词）、"
             "dsh_task（任务提交、列表、详情、进度、中断、继续）、dsh_approval（待审批项查询）、"
-            "dsh_file（DSH 工作区文件读取与发送）、read_own_sent_messages（读取自己已发送的内容）。"
+            "dsh_file（DSH 工作区文件读取与发送）、read_chat_messages（读取当前聊天和自己的发送记录）。"
             "旧的 run_dsh_task、ask_dsh_progress、cancel_dsh_task、continue_dsh_task、"
             "send_workspace_file、read_workspace_file、list_dsh_sessions、operate_dsh_session 已经下线，"
             "不要调用这些名称，也不要用 AstrBot 自带的同类工具代替。\n"
@@ -1050,8 +1214,9 @@ class Main(star.Star):
             "待审批项有多条时推送文案会带审批编号与序号，管理员可以回复「允许 审批编号」或「拒绝 审批编号」"
             "精确处理某一项；审批决定必须由管理员本人作出，模型不得代替管理员批准或拒绝，"
             "也不要根据最近的审批结果推断下一次审批会被允许。\n"
-            "8. 需要查看会话双方历史消息、DSH 之前的输出，或判断某个会话最近在做什么时，"
-            "用 dsh_session 的 history 或 status 动作读取，不要凭记忆回答。\n"
+            "8. 需要回看当前聊天（私聊/群聊）、确认自己刚发过什么，或检查 DSH 回传是否到达时，"
+            "用 read_chat_messages；它默认同时返回当前聊天记录和机器人自己的发送记录，"
+            "不要凭记忆回答，也不要直接回答“看不到”或“没有推回来”。\n"
             f"9. DSH 只给最高管理员（QQ {self._admin_qq}）使用。其他人询问 DSH、要求用 DSH 做事、"
             "或者让你操作电脑、写文件、跑命令时，必须明确拒绝，不要答应，也不要向他们介绍 DSH 的能力。"
             "拒绝时用普通聊天的语气，不要说教，也不要说'可以'或'我交给它弄'。\n"
@@ -1565,6 +1730,6 @@ class Main(star.Star):
             )
         return (
             "最近已向用户推送过的内容（这些内容不在当前对话上下文里，"
-            "如果用户询问已经发送的结果或文件，调用 read_own_sent_messages 读取，"
+            "如果用户询问已经发送的结果、文件或聊天记录，调用 read_chat_messages 读取，"
             "不要回答“结果没有推回来”）：\n" + "\n".join(lines) + "\n"
         )

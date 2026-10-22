@@ -173,7 +173,7 @@
 2. `dsh_task`：`action` 为 `run`、`list`、`status`、`progress`、`cancel`、`continue`；参数包含 `task_id`、`session_id`、`prompt`、`status`、`limit`。
 3. `dsh_approval`：`action` 为 `list`。
 4. `dsh_file`：`action` 为 `send`、`read`；参数包含 `file_name`、`start`、`max_chars`。
-5. `read_own_sent_messages`：保留现有实现。
+5. `read_chat_messages`：读取当前聊天记录，并与机器人自己的发送记录合并返回；`action` 支持 `all`、`chat`、`sent`。
 
 工具描述必须说明：读取 DSH 文件走 `dsh_file`，所有任务与会话操作必须精确指定目标，无法唯一确定时先查询。旧工具名不再注册，避免模型在多个相似工具之间选择。
 

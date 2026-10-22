@@ -1,6 +1,6 @@
 // DSH 客户端插件：侧边栏“聊天机器人”入口与管理页面
 window.__ModuleLoader__.load({
-    id: "@local/dsh-chatbot-bridge",
+    id: "dsh-chatbot-bridge",
     factory: (require) => {
         var module = { exports: {} };
         var exports = module.exports;

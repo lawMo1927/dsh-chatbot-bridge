@@ -11,6 +11,7 @@ window.__ModuleLoader__.load({
 
         const PANEL_ID = "chatbot";
         const BRIDGE = "http://127.0.0.1:9412";
+        let setupPopupAttempted = false;
 
         function tabStyle(active) {
             return {
@@ -136,7 +137,6 @@ window.__ModuleLoader__.load({
             const [advanced, setAdvanced] = react.useState({ astrbotDir: "", astrbotExe: "", astrbotWebui: "http://127.0.0.1:6185", napcatWebui: "", napcatToken: "", napcatDir: "", napcatLauncher: "" });
             const [setupResult, setSetupResult] = react.useState(null);
             const [setupStatus, setSetupStatus] = react.useState(null);
-            const setupPopupAttempted = react.useRef(false);
             const [starting, setStarting] = react.useState(false);
             const [settingsLoaded, setSettingsLoaded] = react.useState(false);
 
@@ -355,8 +355,8 @@ window.__ModuleLoader__.load({
                 try {
                     const data = await api("/admin/astrbot/setup-status");
                     setSetupStatus(data);
-                    if (data.online && data.setupRequired && !setupPopupAttempted.current) {
-                        setupPopupAttempted.current = true;
+                    if (data.online && data.setupRequired && !setupPopupAttempted) {
+                        setupPopupAttempted = true;
                         const popup = window.open(data.webui || advanced.astrbotWebui || "http://127.0.0.1:6185", "_blank");
                         setMessage(
                             popup

@@ -69,9 +69,9 @@
 }
 ```
 
-- `role`：`user`、`assistant`、`system`。
-- `source`：`bot`、`human`、`dsh`、`system`。
-- `kind`：`prompt`、`text`、`tool`、`approval`、`status`。
+- `role`：`user`、`assistant`。
+- `source`：`bot`、`human`、`dsh`。
+- `kind`：`prompt`、`text`。历史只返回用户发出的提示词与 DSH 的自然语言回复；工具调用、工具结果与审批记录通过 `/events` 读取，避免把执行细节混进双方对话。
 - 读取方式：使用 `ctx.sessionController.follow` 的首个 snapshot 取得 `cursor` 与最近记录；更早内容用 `ctx.sessionController.page({ address, throughSeq: cursor, beforeSeq, maxMessages })` 继续读取。类型定义位于 `C:\Users\13826\AppData\Roaming\npm\node_modules\@deepseek-ai\dsh\node_modules\@deepseek-ai\dsh-api-session-controller\lib\types\types.d.ts`。
 
 ### GET /tasks?sessionId=&status=&limit=50

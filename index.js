@@ -80,6 +80,19 @@ function messageText(message) {
     return parts.join('').trim();
 }
 
+// 只保留自然语言与附件占位，用于会话历史；工具调用和工具结果走事件流
+function naturalMessageText(message) {
+    const blocks = Array.isArray(message?.content) ? message.content : [];
+    const parts = [];
+    for (const block of blocks) {
+        if (!block || typeof block !== 'object') continue;
+        if (block.type === 'text' && typeof block.text === 'string') parts.push(block.text);
+        else if (block.type === 'image') parts.push('（图片）');
+        else if (block.type === 'file') parts.push('（文件）');
+    }
+    return parts.join('').trim();
+}
+
 function classifyUserSource(source) {
     if (!source || typeof source !== 'object') return 'human';
     if (typeof source.rpcId === 'string' && source.rpcId) {
@@ -92,14 +105,15 @@ function classifyUserSource(source) {
 function summarizeSessionEvent(event) {
     const data = event.data || {};
     if (event.type === 'user/message') {
-        const source = classifyUserSource(data.message?.source);
+        const message = data.message || data;
+        const source = classifyUserSource(message.source);
         return {
             type: 'user/message',
             data: {
                 role: 'user',
                 source,
                 kind: source === 'system' ? 'status' : 'prompt',
-                text: truncateText(messageText(data.message), MAX_EVENT_TEXT_CHARS)
+                text: truncateText(messageText(message), MAX_EVENT_TEXT_CHARS)
             }
         };
     }
@@ -181,61 +195,35 @@ function summarizeSessionEvent(event) {
     return null;
 }
 
-// 把会话历史记录转换成双方消息条目
+// 把会话历史记录转换成双方自然语言消息条目；工具记录由 /events 提供
 function historyMessage(record) {
     const event = record && record.event ? record.event : null;
     if (!event || !Number.isInteger(event.seq)) return null;
     const data = event.data || {};
     if (event.type === 'user/message') {
-        const source = classifyUserSource(data.message?.source);
+        const message = data.message || data;
+        const source = classifyUserSource(message.source);
+        const text = naturalMessageText(message);
+        if (!text) return null;
         return {
             seq: event.seq,
             time: event.time,
             role: 'user',
             source,
             kind: source === 'system' ? 'status' : 'prompt',
-            text: truncateText(messageText(data.message), MAX_MESSAGE_TEXT_CHARS)
+            text: truncateText(text, MAX_MESSAGE_TEXT_CHARS)
         };
     }
     if (event.type === 'assistant/message') {
-        const text = truncateText(messageText(data.message), MAX_MESSAGE_TEXT_CHARS);
+        const text = naturalMessageText(data.message);
         if (!text) return null;
-        return { seq: event.seq, time: event.time, role: 'assistant', source: 'dsh', kind: 'text', text };
-    }
-    if (event.type === 'tool/call') {
         return {
             seq: event.seq,
             time: event.time,
             role: 'assistant',
             source: 'dsh',
-            kind: 'tool',
-            text: truncateText(`调用工具 ${data.name || '未知工具'}：${data.arguments || ''}`, MAX_MESSAGE_TEXT_CHARS)
-        };
-    }
-    if (event.type === 'tool/result') {
-        const failed = Boolean(data.message && data.message.isError);
-        const resultText = messageText(data.message);
-        return {
-            seq: event.seq,
-            time: event.time,
-            role: 'assistant',
-            source: 'dsh',
-            kind: 'tool',
-            text: truncateText(
-                `${failed ? '工具执行失败' : '工具执行结果'}${resultText ? '：' + resultText : ''}`,
-                MAX_MESSAGE_TEXT_CHARS
-            )
-        };
-    }
-    if (event.type === 'approval/asked') {
-        const reason = data.reason ? `，原因：${data.reason}` : '';
-        return {
-            seq: event.seq,
-            time: event.time,
-            role: 'system',
-            source: 'system',
-            kind: 'approval',
-            text: truncateText(`等待审批：工具 ${data.toolName || '未知工具'}${reason}`, MAX_MESSAGE_TEXT_CHARS)
+            kind: 'text',
+            text: truncateText(text, MAX_MESSAGE_TEXT_CHARS)
         };
     }
     return null;

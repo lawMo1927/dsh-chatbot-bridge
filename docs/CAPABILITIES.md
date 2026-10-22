@@ -127,6 +127,23 @@
 
 在现有字段基础上补充 `sessionId`、`taskId`、`command` 与 `createdAt`，供机器人查询审批详情。
 
+### GET /approvals?limit=20
+
+返回待审批项与最近已结束的审批：
+
+```json
+{
+  "pending": [
+    { "id": "approval_...", "toolName": "exec_shell", "reason": "...", "command": "...", "sessionId": "session-...", "taskId": "task_...", "createdAt": "2026-10-22T..." }
+  ],
+  "recent": [
+    { "id": "approval_...", "toolName": "exec_shell", "reason": "...", "command": "...", "sessionId": "session-...", "taskId": "task_...", "createdAt": "2026-10-22T...", "decidedAt": "2026-10-22T...", "outcome": "allowed-once" }
+  ]
+}
+```
+
+审批捕获范围：桥接会话，以及桥接服务为它提交过任务的其它会话；不属于桥接管理的会话仍由页面通道处理，避免把无关审批推给管理员。
+
 ### GET /events?sessionId=&sinceSeq=
 
 返回增量事件，供适配器轮询：
@@ -143,6 +160,10 @@
 ```
 
 事件来源包括会话 follow 流、任务状态变化、报告与审批。桥接内部保留最近 500 条事件。
+
+### GET /events/stream?sessionId=&sinceSeq=
+
+事件订阅的 SSE 接口，返回 `text/event-stream`。连接建立后先补发 `sinceSeq` 之后的历史事件，随后实时推送新事件；每 15 秒发送一次注释保持连接。事件载荷与 `/events` 的单项结构相同。客户端断开后桥接移除订阅。
 
 ## AstrBot 适配器工具
 

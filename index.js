@@ -57,8 +57,11 @@ function sendJson(res, statusCode, payload) {
 
 const MAX_BRIDGE_EVENTS = 500;
 const MAX_RECENT_TOOL_CALLS = 500;
+const MAX_APPROVAL_HISTORY = 100;
 const MAX_EVENT_TEXT_CHARS = 4000;
 const MAX_MESSAGE_TEXT_CHARS = 8000;
+const MAX_SSE_BUFFER_BYTES = 4 * 1024 * 1024;
+const SSE_HEARTBEAT_MS = 15_000;
 // 桥接自己提交提示词时使用的 requestId 前缀，用于区分机器人提示词与真人提示词
 const QQ_REQUEST_PREFIX = 'qq-req-';
 
@@ -241,8 +244,10 @@ export function apply(ctx, pluginConfig) {
     const log = createLogger(config.logFile);
     const manager = new TaskManager(config.workspace);
     const pendingApprovals = new Map();
+    const approvalHistory = [];
     const recentToolCalls = new Map();
     const bridgeEvents = [];
+    const eventStreams = new Set();
     // sessionId -> 当前打开的回合号，用于把追加指令绑定到正确的回合
     const openTurns = new Map();
     let bridgeEventSeq = 0;
@@ -253,17 +258,19 @@ export function apply(ctx, pluginConfig) {
 
     function recordBridgeEvent(sessionId, type, data, taskId) {
         bridgeEventSeq += 1;
-        bridgeEvents.push({
+        const event = {
             seq: bridgeEventSeq,
             time: Date.now(),
             sessionId: sessionId || null,
             taskId: taskId || null,
             type,
             data: data || {}
-        });
+        };
+        bridgeEvents.push(event);
         if (bridgeEvents.length > MAX_BRIDGE_EVENTS) {
             bridgeEvents.splice(0, bridgeEvents.length - MAX_BRIDGE_EVENTS);
         }
+        broadcastBridgeEvent(event);
     }
 
     function recordTaskEvent(type, task, extra) {
@@ -300,8 +307,24 @@ export function apply(ctx, pluginConfig) {
         }
     }
 
+    // 从审批请求里尽量提取会话编号；不同形态的宿主对象可能给出不同字段
+    function extractApprovalSessionId(req) {
+        if (!req) return null;
+        const agent = req.agent;
+        const candidates = [
+            agent && agent.session && agent.session.id,
+            agent && agent.sessionId,
+            req.sessionId,
+            agent && agent.id
+        ];
+        for (const candidate of candidates) {
+            if (typeof candidate === 'string' && candidate) return candidate;
+        }
+        return null;
+    }
+
     function approvalContext(req) {
-        const sessionId = (req && req.agent && ((req.agent.session && req.agent.session.id) || req.agent.id)) || null;
+        const sessionId = extractApprovalSessionId(req);
         const taskId = sessionId ? manager.currentTaskFor(sessionId) : null;
         const callId = req && req.callId ? String(req.callId) : '';
         const call = callId ? recentToolCalls.get(callId) : null;
@@ -310,6 +333,151 @@ export function apply(ctx, pluginConfig) {
             taskId,
             command: call ? call.arguments : null
         };
+    }
+
+    // 只接管桥接默认会话与桥接提交过任务的会话，其它会话的审批交回页面通道
+    function isManagedApprovalSession(sessionId) {
+        if (!sessionId) return false;
+        if (manager.sessionId && sessionId === manager.sessionId) return true;
+        return manager.listTasks({ sessionId, limit: 1 }).length > 0;
+    }
+
+    function pendingApprovalView(item) {
+        return {
+            id: item.id,
+            toolName: item.toolName,
+            reason: item.reason,
+            callId: item.callId,
+            sessionId: item.sessionId,
+            taskId: item.taskId,
+            command: item.command,
+            createdAt: item.createdAt
+        };
+    }
+
+    function approvalHistoryView(record) {
+        return {
+            id: record.id,
+            toolName: record.toolName,
+            reason: record.reason,
+            callId: record.callId,
+            sessionId: record.sessionId,
+            taskId: record.taskId,
+            command: record.command,
+            createdAt: record.createdAt,
+            decidedAt: record.decidedAt,
+            outcome: record.outcome,
+            status: record.status
+        };
+    }
+
+    function beginApprovalHistory(entry) {
+        const record = {
+            id: entry.id,
+            toolName: entry.toolName,
+            reason: entry.reason,
+            callId: entry.callId,
+            sessionId: entry.sessionId,
+            taskId: entry.taskId,
+            command: entry.command,
+            createdAt: entry.createdAt,
+            decidedAt: null,
+            outcome: null,
+            status: 'pending'
+        };
+        approvalHistory.push(record);
+        if (approvalHistory.length > MAX_APPROVAL_HISTORY) {
+            approvalHistory.splice(0, approvalHistory.length - MAX_APPROVAL_HISTORY);
+        }
+        return record;
+    }
+
+    function endApprovalHistory(record, status, outcome) {
+        if (!record) return;
+        record.status = status;
+        record.outcome = outcome;
+        record.decidedAt = new Date().toISOString();
+    }
+
+    function normalizeApprovalOutcome(outcome) {
+        if (outcome === 'allow' || outcome === 'allowed-once') return 'allowed-once';
+        if (outcome === 'deny' || outcome === 'rejected') return 'rejected';
+        if (outcome === 'cancelled') return 'cancelled';
+        return 'unavailable';
+    }
+
+    // SSE 订阅：eventStreams 里的连接按 sessionId 过滤接收增量事件
+    function writeEventStream(stream, event) {
+        if (stream.closed || stream.res.writableEnded) return;
+        if (stream.res.writableLength > MAX_SSE_BUFFER_BYTES) {
+            log(`事件订阅积压超过上限，断开连接 session=${stream.sessionId || '全部'}`);
+            closeEventStream(stream);
+            return;
+        }
+        try {
+            stream.res.write(`data: ${JSON.stringify(event)}\n\n`);
+        } catch (error) {
+            closeEventStream(stream);
+        }
+    }
+
+    function closeEventStream(stream) {
+        if (!stream || stream.closed) return;
+        stream.closed = true;
+        clearInterval(stream.heartbeat);
+        eventStreams.delete(stream);
+        try {
+            stream.res.end();
+        } catch (error) {
+            // 连接已经断开，无需再处理
+        }
+    }
+
+    function closeAllEventStreams() {
+        for (const stream of Array.from(eventStreams)) {
+            closeEventStream(stream);
+        }
+    }
+
+    function broadcastBridgeEvent(event) {
+        for (const stream of Array.from(eventStreams)) {
+            if (stream.sessionId && event.sessionId !== stream.sessionId) continue;
+            writeEventStream(stream, event);
+        }
+    }
+
+    function openEventStream(req, res, sessionId, sinceSeq) {
+        res.writeHead(200, {
+            'Content-Type': 'text/event-stream; charset=utf-8',
+            'Cache-Control': 'no-cache, no-transform',
+            Connection: 'keep-alive',
+            'Access-Control-Allow-Origin': '*',
+            'X-Accel-Buffering': 'no'
+        });
+        res.write(': connected\n\n');
+        const stream = { res, sessionId, closed: false, heartbeat: null };
+        stream.heartbeat = setInterval(() => {
+            if (stream.closed || res.writableEnded) {
+                closeEventStream(stream);
+                return;
+            }
+            try {
+                res.write(': ping\n\n');
+            } catch (error) {
+                closeEventStream(stream);
+            }
+        }, SSE_HEARTBEAT_MS);
+        eventStreams.add(stream);
+        for (const event of bridgeEvents) {
+            if (event.seq <= sinceSeq) continue;
+            if (sessionId && event.sessionId !== sessionId) continue;
+            writeEventStream(stream, event);
+        }
+        const close = () => closeEventStream(stream);
+        req.on('close', close);
+        req.on('error', close);
+        res.on('close', close);
+        log(`事件订阅已建立 session=${sessionId || '全部'} sinceSeq=${sinceSeq} 订阅数=${eventStreams.size}`);
     }
 
     function clampLimit(raw, fallback) {
@@ -542,10 +710,13 @@ export function apply(ctx, pluginConfig) {
     const NEVER = new Promise(() => {});
 
     const approvalDisposer = ctx.on('approval/request', async (req, next) => {
-        if (!manager.sessionId) return next();
-        const id = `approval_${Date.now()}_${approvalSeq++}`;
         const context = approvalContext(req);
-        log(`收到审批请求 ${id}: tool=${req.toolName} reason=${req.reason} session=${context.sessionId || '-'}`);
+        if (!isManagedApprovalSession(context.sessionId)) {
+            log(`审批请求不属于桥接管理的会话，交回页面通道 session=${context.sessionId || '-'} tool=${req.toolName || '-'}`);
+            return next();
+        }
+        const id = `approval_${Date.now()}_${approvalSeq++}`;
+        log(`收到审批请求 ${id}: tool=${req.toolName} reason=${req.reason} session=${context.sessionId}`);
 
         const pagePromise = next().then(
             (outcome) => {
@@ -561,12 +732,11 @@ export function apply(ctx, pluginConfig) {
             }
         );
 
+        let entry = null;
+        let historyRecord = null;
         const qqPromise = new Promise((resolve) => {
-            const timer = setTimeout(() => {
-                pendingApprovals.delete(id);
-                resolve('rejected');
-            }, config.approvalTimeoutSeconds * 1000);
-            const entry = {
+            let timer = null;
+            entry = {
                 id,
                 toolName: String(req.toolName || ''),
                 reason: String(req.reason || ''),
@@ -575,13 +745,20 @@ export function apply(ctx, pluginConfig) {
                 taskId: context.taskId,
                 command: context.command,
                 createdAt: new Date().toISOString(),
+                timedOut: false,
                 resolve: (value) => {
-                    clearTimeout(timer);
+                    if (timer) clearTimeout(timer);
                     pendingApprovals.delete(id);
                     resolve(value);
                 }
             };
+            timer = setTimeout(() => {
+                entry.timedOut = true;
+                pendingApprovals.delete(id);
+                resolve('rejected');
+            }, config.approvalTimeoutSeconds * 1000);
             pendingApprovals.set(id, entry);
+            historyRecord = beginApprovalHistory(entry);
             recordBridgeEvent(entry.sessionId, 'approval/pending', {
                 text: '等待审批',
                 toolName: entry.toolName,
@@ -593,14 +770,18 @@ export function apply(ctx, pluginConfig) {
 
         const outcome = await Promise.race([pagePromise, qqPromise]);
         pendingApprovals.delete(id);
+        const normalizedOutcome = normalizeApprovalOutcome(outcome);
+        const timedOut = Boolean(entry && entry.timedOut);
+        endApprovalHistory(historyRecord, timedOut ? 'timeout' : 'decided', normalizedOutcome);
         recordBridgeEvent(context.sessionId, 'approval/decided', {
-            text: '审批已结束',
+            text: timedOut ? '审批超时自动拒绝' : '审批已结束',
             approvalId: id,
-            outcome,
-            allowed: outcome === 'allow' || outcome === 'allowed-once'
+            outcome: normalizedOutcome,
+            status: timedOut ? 'timeout' : 'decided',
+            allowed: normalizedOutcome === 'allowed-once'
         }, context.taskId);
-        log(`审批 ${id} 结果: ${outcome}`);
-        return outcome === 'allow' || outcome === 'allowed-once' ? 'allowed-once' : 'rejected';
+        log(`审批 ${id} 结果: ${outcome}${timedOut ? '（超时）' : ''}`);
+        return normalizedOutcome === 'allowed-once' ? 'allowed-once' : 'rejected';
     }, { prepend: true });
     ctx.effect(() => approvalDisposer);
 
@@ -1412,17 +1593,19 @@ export function apply(ctx, pluginConfig) {
             }
 
             if (req.method === 'GET' && url.pathname === '/approvals/pending') {
-                const pending = Array.from(pendingApprovals.values()).map((item) => ({
-                    id: item.id,
-                    toolName: item.toolName,
-                    reason: item.reason,
-                    callId: item.callId,
-                    sessionId: item.sessionId,
-                    taskId: item.taskId,
-                    command: item.command,
-                    createdAt: item.createdAt
-                }));
+                const pending = Array.from(pendingApprovals.values()).map(pendingApprovalView);
                 return sendJson(res, 200, { pending });
+            }
+
+            if (req.method === 'GET' && url.pathname === '/approvals') {
+                const limit = clampLimit(url.searchParams.get('limit'), 20);
+                const pending = Array.from(pendingApprovals.values()).map(pendingApprovalView).slice(0, limit);
+                const recent = approvalHistory
+                    .filter((record) => record.status !== 'pending')
+                    .sort((left, right) => Date.parse(right.decidedAt) - Date.parse(left.decidedAt))
+                    .slice(0, limit)
+                    .map(approvalHistoryView);
+                return sendJson(res, 200, { pending, recent });
             }
 
             if (req.method === 'POST' && url.pathname === '/approval/answer') {
@@ -1453,6 +1636,14 @@ export function apply(ctx, pluginConfig) {
                     const message = error && error.name === 'AbortError' ? '读取会话历史超时' : error.message;
                     return sendJson(res, 500, { error: message });
                 }
+            }
+
+            if (req.method === 'GET' && url.pathname === '/events/stream') {
+                const sessionId = url.searchParams.get('sessionId') || '';
+                const sinceSeqRaw = Number(url.searchParams.get('sinceSeq'));
+                const sinceSeq = Number.isInteger(sinceSeqRaw) && sinceSeqRaw > 0 ? sinceSeqRaw : 0;
+                openEventStream(req, res, sessionId, sinceSeq);
+                return;
             }
 
             if (req.method === 'GET' && url.pathname === '/events') {
@@ -1922,8 +2113,13 @@ export function apply(ctx, pluginConfig) {
         log(`桥接插件 HTTP 服务监听 http://127.0.0.1:${config.port}`);
     });
 
+    server.on('close', () => {
+        closeAllEventStreams();
+    });
+
     ctx.effect(() => () => {
         shuttingDown = true;
+        closeAllEventStreams();
         server.close();
         log('桥接插件已停止');
     });

@@ -22,6 +22,18 @@ SENT_TEXT_LIMIT = 6000
 SENT_FILE_READ_LIMIT = 64 * 1024
 APPROVAL_ALLOW_WORDS = {"允许", "同意", "allow", "yes", "ok", "可以", "好"}
 APPROVAL_DENY_WORDS = {"拒绝", "不同意", "deny", "no", "不行", "不要"}
+APPROVAL_OUTCOME_LABELS = {
+    "allow": "已允许",
+    "allowed": "已允许",
+    "allowed-once": "已允许（一次）",
+    "deny": "已拒绝",
+    "denied": "已拒绝",
+    "reject": "已拒绝",
+    "rejected": "已拒绝",
+    "cancelled": "已取消",
+    "unavailable": "审批通道不可用",
+    "timeout": "超时自动拒绝",
+}
 PROMPT_MODES = ("auto", "queue", "steer")
 
 
@@ -610,8 +622,10 @@ class Main(star.Star):
 
     @filter.llm_tool(name="dsh_approval")
     async def dsh_approval(self, event: AstrMessageEvent, action: str = "list") -> str:
-        """查询 DSH 的待审批项，包括工具、命令、原因、所属会话与任务、已等待时间。
-        当用户询问是否在等审批、审批要批什么、任务为什么停住时调用。
+        """查询 DSH 的审批情况：当前待审批项与最近已结束的审批。
+        待审批项包含工具、命令、原因、所属会话与任务、已等待时间；
+        最近已结束的审批包含工具、命令、原因、会话、任务、发起时间、结束时间与结果。
+        当用户询问是否在等审批、审批要批什么、任务为什么停住，或想确认刚才的审批结果时调用。
         本工具只能查询；审批决定必须由管理员本人在 QQ 里回复，不要代替管理员批准或拒绝。
 
         Args:
@@ -621,24 +635,59 @@ class Main(star.Star):
             return "这个功能仅限管理员使用。"
         if (action or "").strip().lower() != "list":
             return "action 目前只支持 list。"
+        return await self._approval_list()
+
+    async def _approval_list(self) -> str:
+        try:
+            data = await self._bridge("GET", "/approvals?limit=20")
+        except BridgeError as error:
+            if error.status == 404:
+                return await self._approval_list_legacy(error)
+            logger.error(f"dsh_bridge 获取审批列表失败: {error}")
+            return self._bridge_error_text("读取审批列表（GET /approvals）", error)
+        except Exception as error:
+            logger.error(f"dsh_bridge 获取审批列表失败: {error}")
+            return self._bridge_error_text("读取审批列表（GET /approvals）", error)
+        pending = data.get("pending") or []
+        recent = data.get("recent") or []
+        lines = []
+        if pending:
+            lines.append(f"待审批 {len(pending)} 项：")
+            lines.extend(self._format_approval(item) for item in pending)
+        else:
+            lines.append("当前没有待审批项。")
+        if recent:
+            lines.append(f"最近已结束的审批 {len(recent)} 项：")
+            lines.extend(self._format_approval(item, finished=True) for item in recent)
+        else:
+            lines.append("最近没有已结束的审批记录。")
+        lines.append(
+            "审批决定由管理员在 QQ 里回复「允许」或「拒绝」作出，"
+            "你只负责查询，不要代替管理员决定，也不要声称已经批准或拒绝。"
+        )
+        return "\n".join(lines)
+
+    async def _approval_list_legacy(self, cause: Exception) -> str:
+        logger.info(f"dsh_bridge 新审批接口不可用（{cause}），回退到 /approvals/pending")
         try:
             data = await self._bridge("GET", "/approvals/pending")
         except Exception as error:
             logger.error(f"dsh_bridge 获取待审批项失败: {error}")
             return self._bridge_error_text("读取待审批项（GET /approvals/pending）", error)
         approvals = data.get("pending") or []
-        if not approvals:
-            return "当前没有待审批项。"
-        lines = [f"当前有 {len(approvals)} 项待审批："]
-        for item in approvals:
-            lines.append(self._format_approval(item))
+        lines = ["桥接版本较旧，尚未提供最近已结束的审批查询，下面只展示待审批项。"]
+        if approvals:
+            lines.append(f"待审批 {len(approvals)} 项：")
+            lines.extend(self._format_approval(item) for item in approvals)
+        else:
+            lines.append("当前没有待审批项。")
         lines.append(
             "审批决定由管理员在 QQ 里回复「允许」或「拒绝」作出，"
-            "你只负责查询，不要代替管理员决定，也不要声称已经批准。"
+            "你只负责查询，不要代替管理员决定，也不要声称已经批准或拒绝。"
         )
         return "\n".join(lines)
 
-    def _format_approval(self, item: dict) -> str:
+    def _format_approval(self, item: dict, finished: bool = False) -> str:
         lines = [f"- 审批编号 {item.get('id') or '未知'}｜工具 {item.get('toolName') or '未知工具'}"]
         if item.get("sessionId"):
             lines.append(f"  会话：{item.get('sessionId')}")
@@ -653,10 +702,28 @@ class Main(star.Star):
         created_at = item.get("createdAt")
         if created_at:
             lines.append(f"  发起时间：{self._format_time(created_at)}")
+        if finished:
+            decided_at = item.get("decidedAt") or item.get("finishedAt")
+            if decided_at:
+                lines.append(f"  结束时间：{self._format_time(decided_at)}")
+            status = item.get("status")
+            outcome = item.get("outcome")
+            if status == "timeout":
+                lines.append("  结果：超时自动拒绝")
+            elif outcome is None or outcome == "":
+                lines.append("  结果：未知")
+            else:
+                lines.append(f"  结果：{self._approval_outcome_label(outcome)}")
+        elif created_at:
             elapsed = self._elapsed_ms(created_at)
             if elapsed is not None:
                 lines.append(f"  已等待：{self._format_duration(elapsed)}")
         return "\n".join(lines)
+
+    @staticmethod
+    def _approval_outcome_label(outcome) -> str:
+        value = str(outcome)
+        return APPROVAL_OUTCOME_LABELS.get(value, value)
 
     @staticmethod
     def _format_time(value) -> str:
@@ -895,8 +962,9 @@ class Main(star.Star):
             "6. 读取或发送 DSH 工作区内的文件只用 dsh_file；不要使用 astrbot_file_read_tool、"
             "astrbot_file_write_tool 等 AstrBot 自带文件工具处理 DSH 工作区。\n"
             "7. DSH 执行任务时遇到越权操作（工作区外读写、需要提权的命令）会自动向管理员发起审批。"
-            "用 dsh_approval 可以查询待审批项的工具、命令、原因与所属会话；审批决定必须由管理员在 QQ 里亲自回复，"
-            "模型不得代替管理员批准或拒绝，也不要声称审批已经通过。\n"
+            "用 dsh_approval 可以查询待审批项的工具、命令、原因与所属会话，也可以查看最近已结束审批的时间与结果；"
+            "审批决定必须由管理员在 QQ 里亲自回复，模型不得代替管理员批准或拒绝，"
+            "也不要根据最近的审批结果推断下一次审批会被允许。\n"
             "8. 需要查看会话双方历史消息、DSH 之前的输出，或判断某个会话最近在做什么时，"
             "用 dsh_session 的 history 或 status 动作读取，不要凭记忆回答。\n"
             f"9. DSH 只给最高管理员（QQ {self._admin_qq}）使用。其他人询问 DSH、要求用 DSH 做事、"

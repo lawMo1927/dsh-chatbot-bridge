@@ -1206,13 +1206,87 @@ export function apply(ctx, pluginConfig) {
         return null;
     }
 
+    function findAstrbot() {
+        const home = process.env.USERPROFILE || '';
+        const dirs = [
+            config.astrbot.dir,
+            path.join(process.env.APPDATA || '', 'uv', 'tools', 'astrbot'),
+            path.join(process.env.LOCALAPPDATA || '', 'uv', 'tools', 'astrbot'),
+            path.join(home, '.local', 'share', 'uv', 'tools', 'astrbot'),
+            path.join(home, 'uv', 'tools', 'astrbot')
+        ];
+        for (const dir of dirs) {
+            if (!dir || !fs.existsSync(dir)) continue;
+            const exeCandidates = [
+                config.astrbot.exe,
+                path.join(dir, 'Scripts', 'astrbot.exe'),
+                path.join(dir, 'astrbot.exe')
+            ];
+            for (const exe of exeCandidates) {
+                if (exe && fs.existsSync(exe)) return { dir, exe };
+            }
+        }
+        return { dir: '', exe: '' };
+    }
+
+    function findNapcat() {
+        const home = process.env.USERPROFILE || '';
+        const dirs = [
+            config.napcat.dir,
+            path.join(home, 'napcat'),
+            'C:\\NapCat'
+        ];
+        for (const dir of dirs) {
+            if (!dir || !fs.existsSync(dir)) continue;
+            const launcherCandidates = [
+                config.napcat.launcher,
+                path.join(dir, 'launcher.bat'),
+                path.join(dir, 'NapCatWinBootMain.exe')
+            ];
+            for (const launcher of launcherCandidates) {
+                if (launcher && fs.existsSync(launcher)) return { dir, launcher };
+            }
+        }
+        return { dir: '', launcher: '' };
+    }
+
+    async function waitForPort(port, timeoutMs) {
+        const deadline = Date.now() + timeoutMs;
+        while (Date.now() < deadline) {
+            if (await isPortOpen(port)) return true;
+            await new Promise((resolve) => setTimeout(resolve, 1000));
+        }
+        return false;
+    }
+
+    async function startNapcat() {
+        if (await isPortOpen(6099)) return { ok: true, already: true };
+        if (!fs.existsSync(config.napcat.launcher)) {
+            return { ok: false, error: `NapCat 启动脚本不存在: ${config.napcat.launcher}` };
+        }
+        const child = spawn('cmd.exe', ['/c', config.napcat.launcher], {
+            cwd: config.napcat.dir,
+            windowsHide: true,
+            detached: true,
+            stdio: 'ignore'
+        });
+        child.on('error', (error) => {
+            log(`NapCat 子进程错误: ${error.message}`);
+        });
+        child.unref();
+        log(`已启动 NapCat launcher pid=${child.pid}`);
+        return { ok: true, pid: child.pid, note: '正在启动 NapCat，稍后查看 QQ 登录状态' };
+    }
+
     async function checkEnv() {
         const uv = findUv();
         const qqPath = findQq();
+        const astrbot = findAstrbot();
+        const napcat = findNapcat();
         return {
             uv: { installed: Boolean(uv), path: uv || '' },
-            astrbot: { installed: fs.existsSync(config.astrbot.exe), path: config.astrbot.exe },
-            napcat: { installed: fs.existsSync(config.napcat.launcher), dir: config.napcat.dir, launcher: config.napcat.launcher },
+            astrbot: { installed: Boolean(astrbot.exe), path: astrbot.exe, dir: astrbot.dir },
+            napcat: { installed: Boolean(napcat.launcher), dir: napcat.dir, launcher: napcat.launcher },
             qq: { installed: Boolean(qqPath), path: qqPath || '' },
             astrbotRunning: await isPortOpen(6185),
             napcatRunning: await isPortOpen(6099),
@@ -1697,6 +1771,7 @@ export function apply(ctx, pluginConfig) {
                     model: config.model,
                     astrbotDir: config.astrbot.dir,
                     astrbotExe: config.astrbot.exe,
+                    astrbotWebui: config.astrbot.webui,
                     napcatWebui: config.napcat.webui,
                     napcatToken: config.napcat.token,
                     napcatDir: config.napcat.dir,
@@ -1729,6 +1804,11 @@ export function apply(ctx, pluginConfig) {
                         data.astrbot.exe = config.astrbot.exe;
                         log(`聊天机器人启动程序已更新: ${config.astrbot.exe}`);
                     }
+                    if (typeof body.astrbotWebui === 'string' && body.astrbotWebui.trim()) {
+                        config.astrbot.webui = body.astrbotWebui.trim();
+                        data.astrbot.webui = config.astrbot.webui;
+                        log(`AstrBot 网页地址已更新: ${config.astrbot.webui}`);
+                    }
                     if (typeof body.napcatWebui === 'string' && body.napcatWebui.trim()) {
                         config.napcat.webui = body.napcatWebui.trim();
                         data.napcat.webui = config.napcat.webui;
@@ -1756,6 +1836,7 @@ export function apply(ctx, pluginConfig) {
                         workspace: config.workspace,
                         astrbotDir: config.astrbot.dir,
                         astrbotExe: config.astrbot.exe,
+                        astrbotWebui: config.astrbot.webui,
                         napcatWebui: config.napcat.webui,
                         napcatToken: config.napcat.token,
                         napcatDir: config.napcat.dir,
@@ -1801,6 +1882,134 @@ export function apply(ctx, pluginConfig) {
                     return sendJson(res, 200, await checkEnv());
                 } catch (error) {
                     return sendJson(res, 500, { error: error.message });
+                }
+            }
+
+            if (req.method === 'GET' && url.pathname === '/admin/setup/detect') {
+                const astrbot = findAstrbot();
+                const napcat = findNapcat();
+                return sendJson(res, 200, {
+                    astrbot: {
+                        dir: astrbot.dir || config.astrbot.dir,
+                        exe: astrbot.exe || config.astrbot.exe,
+                        webui: config.astrbot.webui
+                    },
+                    napcat: {
+                        dir: napcat.dir || config.napcat.dir,
+                        launcher: napcat.launcher || config.napcat.launcher,
+                        webui: config.napcat.webui
+                    }
+                });
+            }
+
+            if (req.method === 'GET' && url.pathname === '/admin/astrbot/setup-status') {
+                if (!(await isPortOpen(6185))) {
+                    return sendJson(res, 200, { online: false });
+                }
+                const controller = new AbortController();
+                const timer = setTimeout(() => controller.abort(), 5000);
+                try {
+                    const response = await fetch(config.astrbot.webui + '/api/v1/auth/setup-status', {
+                        signal: controller.signal
+                    });
+                    const data = await response.json();
+                    const info = data && data.data ? data.data : {};
+                    return sendJson(res, 200, {
+                        online: true,
+                        setupRequired: Boolean(info.setup_required),
+                        skipDefaultPasswordAuth: Boolean(info.skip_default_password_auth),
+                        passwordUpgradeRequired: Boolean(info.password_upgrade_required),
+                        webui: config.astrbot.webui
+                    });
+                } catch (error) {
+                    return sendJson(res, 200, {
+                        online: true,
+                        webui: config.astrbot.webui,
+                        error: error.name === 'AbortError' ? '读取 AstrBot 登录状态超时' : error.message
+                    });
+                } finally {
+                    clearTimeout(timer);
+                }
+            }
+
+            if (req.method === 'POST' && url.pathname === '/admin/setup/apply') {
+                const steps = [];
+                const warnings = [];
+                try {
+                    if (!config.astrbot.dir || !fs.existsSync(config.astrbot.dir)) {
+                        return sendJson(res, 400, {
+                            ok: false,
+                            steps,
+                            warnings,
+                            error: '未找到 AstrBot 目录，请先在安装页填写或点击自动检测'
+                        });
+                    }
+                    if (!config.astrbot.exe || !fs.existsSync(config.astrbot.exe)) {
+                        return sendJson(res, 400, {
+                            ok: false,
+                            steps,
+                            warnings,
+                            error: '未找到 AstrBot 启动程序，请先在安装页填写或点击自动检测'
+                        });
+                    }
+                    const sourceDir = path.join(__dirname, 'adapters', 'astrbot');
+                    const targetDir = path.join(config.astrbot.dir, 'data', 'plugins', 'astrbot_plugin_dsh_bridge');
+                    if (!fs.existsSync(sourceDir)) throw new Error('插件包缺少 adapters/astrbot 目录');
+                    fs.mkdirSync(targetDir, { recursive: true });
+                    for (const file of fs.readdirSync(sourceDir)) {
+                        const sourceFile = path.join(sourceDir, file);
+                        if (!fs.statSync(sourceFile).isFile()) continue;
+                        fs.copyFileSync(sourceFile, path.join(targetDir, file));
+                    }
+                    steps.push(`已安装 AstrBot 适配器：${targetDir}`);
+
+                    if (await isPortOpen(6185)) {
+                        await stopAstrBot();
+                        await new Promise((resolve) => setTimeout(resolve, 1500));
+                        steps.push('已停止旧的聊天机器人进程');
+                    }
+                    const started = await startAstrBot();
+                    if (!started.ok) {
+                        throw new Error(started.error || '启动 AstrBot 失败');
+                    }
+                    const astrbotReady = await waitForPort(6185, 90000);
+                    if (!astrbotReady) {
+                        warnings.push('AstrBot 启动后 90 秒内没有监听 6185 端口，请查看日志');
+                    } else {
+                        steps.push('聊天机器人已启动并监听 6185');
+                    }
+
+                    if (config.napcat.launcher && fs.existsSync(config.napcat.launcher)) {
+                        const napcat = await startNapcat();
+                        if (!napcat.ok) {
+                            warnings.push(napcat.error || 'NapCat 启动失败');
+                        } else {
+                            const napcatReady = await waitForPort(6099, 30000);
+                            if (napcatReady) steps.push('NapCat 已启动并监听 6099');
+                            else warnings.push('NapCat 30 秒内没有监听 6099 端口，请查看日志');
+                        }
+                    } else {
+                        warnings.push('未找到 NapCat 启动脚本，跳过 NapCat 启动');
+                    }
+
+                    let qr = null;
+                    try {
+                        qr = await getQrCode();
+                        if (qr && qr.link) steps.push('已生成 QQ 登录二维码');
+                    } catch (error) {
+                        warnings.push(`二维码获取失败：${error.message}`);
+                    }
+                    return sendJson(res, 200, {
+                        ok: true,
+                        steps,
+                        warnings,
+                        qr,
+                        astrbotRunning: await isPortOpen(6185),
+                        napcatRunning: await isPortOpen(6099)
+                    });
+                } catch (error) {
+                    log(`自动配置失败: ${error.message}`);
+                    return sendJson(res, 500, { ok: false, steps, warnings, error: error.message });
                 }
             }
 

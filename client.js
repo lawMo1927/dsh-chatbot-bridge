@@ -109,7 +109,7 @@ window.__ModuleLoader__.load({
         }
 
         function ChatbotPanelPage() {
-            const [tab, setTab] = react.useState("process");
+            const [tab, setTab] = react.useState("setup");
             const [status, setStatus] = react.useState(null);
             const [error, setError] = react.useState("");
             const [message, setMessage] = react.useState("");
@@ -133,7 +133,10 @@ window.__ModuleLoader__.load({
             const [env, setEnv] = react.useState(null);
             const [adminQQ, setAdminQQ] = react.useState("");
             const [workspace, setWorkspace] = react.useState("");
-            const [advanced, setAdvanced] = react.useState({ astrbotDir: "", astrbotExe: "", napcatWebui: "", napcatToken: "", napcatDir: "", napcatLauncher: "" });
+            const [advanced, setAdvanced] = react.useState({ astrbotDir: "", astrbotExe: "", astrbotWebui: "http://127.0.0.1:6185", napcatWebui: "", napcatToken: "", napcatDir: "", napcatLauncher: "" });
+            const [setupResult, setSetupResult] = react.useState(null);
+            const [setupStatus, setSetupStatus] = react.useState(null);
+            const setupPopupAttempted = react.useRef(false);
             const [starting, setStarting] = react.useState(false);
             const [settingsLoaded, setSettingsLoaded] = react.useState(false);
 
@@ -267,6 +270,7 @@ window.__ModuleLoader__.load({
                     setAdvanced({
                         astrbotDir: data.astrbotDir || "",
                         astrbotExe: data.astrbotExe || "",
+                        astrbotWebui: data.astrbotWebui || "http://127.0.0.1:6185",
                         napcatWebui: data.napcatWebui || "",
                         napcatToken: data.napcatToken || "",
                         napcatDir: data.napcatDir || "",
@@ -315,6 +319,105 @@ window.__ModuleLoader__.load({
                     await loadSettings();
                 } catch (err) {
                     setMessage("保存高级设置失败：" + String(err));
+                } finally {
+                    setBusy(false);
+                }
+            };
+
+            const openAstrbotWebui = () => {
+                const url = advanced.astrbotWebui || "http://127.0.0.1:6185";
+                window.open(url, "_blank");
+            };
+
+            const detectSetup = async () => {
+                setBusy(true);
+                setMessage("");
+                try {
+                    const data = await api("/admin/setup/detect");
+                    setAdvanced((prev) => ({
+                        ...prev,
+                        astrbotDir: data.astrbot && data.astrbot.dir ? data.astrbot.dir : prev.astrbotDir,
+                        astrbotExe: data.astrbot && data.astrbot.exe ? data.astrbot.exe : prev.astrbotExe,
+                        astrbotWebui: data.astrbot && data.astrbot.webui ? data.astrbot.webui : prev.astrbotWebui,
+                        napcatDir: data.napcat && data.napcat.dir ? data.napcat.dir : prev.napcatDir,
+                        napcatLauncher: data.napcat && data.napcat.launcher ? data.napcat.launcher : prev.napcatLauncher,
+                        napcatWebui: data.napcat && data.napcat.webui ? data.napcat.webui : prev.napcatWebui
+                    }));
+                    setMessage("路径检测完成，确认后保存");
+                } catch (err) {
+                    setMessage("自动检测失败：" + String(err));
+                } finally {
+                    setBusy(false);
+                }
+            };
+
+            const checkSetupStatus = async () => {
+                try {
+                    const data = await api("/admin/astrbot/setup-status");
+                    setSetupStatus(data);
+                    if (data.online && data.setupRequired && !setupPopupAttempted.current) {
+                        setupPopupAttempted.current = true;
+                        const popup = window.open(data.webui || advanced.astrbotWebui || "http://127.0.0.1:6185", "_blank");
+                        setMessage(
+                            popup
+                                ? "AstrBot 尚未完成首次登录，已打开 AstrBot 网页。"
+                                : "AstrBot 尚未完成首次登录。浏览器拦截了自动弹窗，请点击“打开 AstrBot 网页”。"
+                        );
+                    }
+                    return data;
+                } catch (err) {
+                    setSetupStatus({ online: false, error: String(err) });
+                    return null;
+                }
+            };
+
+            const saveWizardSettings = async () => {
+                const data = await postJson("/admin/settings", {
+                    adminQQ,
+                    workspace,
+                    ...advanced
+                });
+                if (!data.ok) throw new Error(data.error || "保存设置失败");
+                return data;
+            };
+
+            const runGuidedSetup = async () => {
+                const popup = window.open("about:blank", "dsh-astrbot-setup");
+                setBusy(true);
+                setMessage("正在保存设置并启动组件...");
+                setSetupResult(null);
+                try {
+                    await saveWizardSettings();
+                    const result = await postJson("/admin/setup/apply", {});
+                    let loginStatus = null;
+                    try {
+                        loginStatus = await api("/admin/astrbot/setup-status");
+                    } catch (err) {
+                        loginStatus = { online: false, error: String(err) };
+                    }
+                    setSetupResult({ ...result, loginStatus });
+                    if (!result.ok) {
+                        if (popup && !popup.closed) popup.close();
+                        setMessage(result.error || "自动配置没有完成，请查看步骤");
+                    } else {
+                        if (popup && !popup.closed) {
+                            popup.location.replace(advanced.astrbotWebui || "http://127.0.0.1:6185");
+                        } else {
+                            setMessage("自动配置完成，但浏览器拦截了 AstrBot 网页弹窗，请点击“打开 AstrBot 网页”。");
+                        }
+                        if (loginStatus && loginStatus.setupRequired) {
+                            setMessage("组件已启动。AstrBot 尚未完成首次登录，请在打开的 AstrBot 网页里完成登录和模型配置。");
+                        } else {
+                            setMessage("组件已启动。请在打开的 AstrBot 网页里确认登录，并配置模型、人格和平台连接。");
+                        }
+                    }
+                    await refresh();
+                    await loadEnv();
+                    await loadSettings();
+                    if (result.qr && result.qr.link) await loadQr();
+                } catch (err) {
+                    setMessage("自动配置失败：" + String(err));
+                    if (popup && !popup.closed) popup.close();
                 } finally {
                     setBusy(false);
                 }
@@ -519,8 +622,14 @@ window.__ModuleLoader__.load({
                     const timer = setInterval(refresh, 5000);
                     return () => clearInterval(timer);
                 }
-                if (tab === "persona") loadPersonas();
-                if (tab === "model") loadProviders();
+                if (tab === "setup") {
+                    refresh();
+                    loadSettings();
+                    loadEnv();
+                    checkSetupStatus();
+                    const timer = setInterval(refresh, 5000);
+                    return () => clearInterval(timer);
+                }
                 if (tab === "logs") loadLogs();
                 if (tab === "install") {
                     loadEnv();
@@ -537,9 +646,9 @@ window.__ModuleLoader__.load({
 
             const tabs = [
                 ["process", "进程"],
+                ["setup", "向导"],
                 ["install", "安装"],
-                ["persona", "人格"],
-                ["model", "模型与 API"],
+                ["astrbot", "AstrBot"],
                 ["logs", "日志"]
             ];
 
@@ -624,7 +733,12 @@ window.__ModuleLoader__.load({
                                 style: styles.button,
                                 disabled: busy,
                                 onClick: () => run("/admin/astrbot/restart")
-                            }, "重启")
+                            }, "重启"),
+                            react.createElement("button", {
+                                style: styles.button,
+                                disabled: busy,
+                                onClick: openAstrbotWebui
+                            }, "打开 AstrBot 网页")
                         )
                     )
                 ),
@@ -1069,7 +1183,12 @@ window.__ModuleLoader__.load({
                             style: styles.primaryButton,
                             disabled: busy || !(env && env.astrbot && env.astrbot.installed),
                             onClick: installAstrbotPlugin
-                        }, "安装")
+                        }, "安装"),
+                        react.createElement("button", {
+                            style: styles.button,
+                            disabled: busy,
+                            onClick: openAstrbotWebui
+                        }, "打开 AstrBot 网页")
                     )
                 ),
                 react.createElement(
@@ -1103,6 +1222,12 @@ window.__ModuleLoader__.load({
                         style: styles.input,
                         value: advanced.astrbotExe,
                         onChange: (event) => setAdvanced({ ...advanced, astrbotExe: event.target.value })
+                    }),
+                    react.createElement("div", { style: { ...styles.label, marginTop: "10px" } }, "AstrBot 网页地址"),
+                    react.createElement("input", {
+                        style: styles.input,
+                        value: advanced.astrbotWebui,
+                        onChange: (event) => setAdvanced({ ...advanced, astrbotWebui: event.target.value })
                     }),
                     react.createElement("div", { style: { ...styles.label, marginTop: "10px" } }, "NapCat 管理地址"),
                     react.createElement("input", {
@@ -1161,17 +1286,193 @@ window.__ModuleLoader__.load({
                     : null
             );
 
+            const setupField = (label, value, onChange, placeholder, type = "text") => react.createElement(
+                "div",
+                { style: { marginTop: "10px" } },
+                react.createElement("div", { style: styles.label }, label),
+                react.createElement("input", {
+                    style: styles.input,
+                    type,
+                    value,
+                    placeholder: placeholder || "",
+                    onChange: (event) => onChange(event.target.value)
+                })
+            );
+
+            const saveSetup = async () => {
+                setBusy(true);
+                setMessage("");
+                try {
+                    await saveWizardSettings();
+                    setMessage("设置已保存");
+                    await loadSettings();
+                    await loadEnv();
+                } catch (err) {
+                    setMessage("保存设置失败：" + String(err));
+                } finally {
+                    setBusy(false);
+                }
+            };
+
+            const setupTab = react.createElement(
+                "div",
+                null,
+                react.createElement(
+                    "div",
+                    { style: styles.card },
+                    react.createElement("div", { style: styles.label }, "第一次使用"),
+                    react.createElement("div", { style: { color: "var(--dsw-alias-label-secondary)", fontSize: "13px", lineHeight: "1.8" } },
+                        "插件不会要求你在这里填写 AstrBot 的账号密码。登录、模型供应商、人格和平台连接都在 AstrBot 自己的网页里完成。"
+                    ),
+                    setupStatus
+                        ? react.createElement("div", { style: { color: "var(--dsw-alias-label-secondary)", fontSize: "12px", marginTop: "8px" } },
+                            setupStatus.online
+                                ? (setupStatus.setupRequired
+                                    ? "AstrBot 在线，尚未完成首次登录。"
+                                    : "AstrBot 在线，请在 AstrBot 网页确认登录状态。")
+                                : "AstrBot 当前离线。"
+                        )
+                        : null,
+                    setupField("管理员 QQ", adminQQ, setAdminQQ, "机器人只响应这个 QQ 号"),
+                    setupField("工作区目录", workspace, setWorkspace, "机器人执行任务的目录")
+                ),
+                react.createElement(
+                    "div",
+                    { style: styles.card },
+                    react.createElement("div", { style: styles.label }, "AstrBot 与 NapCat"),
+                    setupField("AstrBot 目录", advanced.astrbotDir, (value) => setAdvanced({ ...advanced, astrbotDir: value }), "例如 D:\\qqbot\\astrbot"),
+                    setupField("AstrBot 启动程序", advanced.astrbotExe, (value) => setAdvanced({ ...advanced, astrbotExe: value }), "AstrBot 的可执行文件"),
+                    setupField("AstrBot 网页地址", advanced.astrbotWebui, (value) => setAdvanced({ ...advanced, astrbotWebui: value }), "http://127.0.0.1:6185"),
+                    setupField("NapCat 目录", advanced.napcatDir, (value) => setAdvanced({ ...advanced, napcatDir: value }), "NapCat 安装目录"),
+                    setupField("NapCat 启动脚本", advanced.napcatLauncher, (value) => setAdvanced({ ...advanced, napcatLauncher: value }), "launcher.bat 的完整路径"),
+                    setupField("NapCat 管理地址", advanced.napcatWebui, (value) => setAdvanced({ ...advanced, napcatWebui: value }), "http://127.0.0.1:6099"),
+                    setupField("NapCat token", advanced.napcatToken, (value) => setAdvanced({ ...advanced, napcatToken: value }), "从 NapCat 管理页面获取", "password"),
+                    react.createElement(
+                        "div",
+                        { style: { display: "flex", flexWrap: "wrap", gap: "8px", marginTop: "14px" } },
+                        react.createElement("button", {
+                            style: styles.button,
+                            disabled: busy,
+                            onClick: detectSetup
+                        }, "自动检测路径"),
+                        react.createElement("button", {
+                            style: styles.primaryButton,
+                            disabled: busy,
+                            onClick: saveSetup
+                        }, "保存设置"),
+                        react.createElement("button", {
+                            style: styles.button,
+                            disabled: busy,
+                            onClick: openAstrbotWebui
+                        }, "打开 AstrBot 网页")
+                    )
+                ),
+                react.createElement(
+                    "div",
+                    { style: styles.card },
+                    react.createElement("div", { style: styles.label }, "安装缺失组件"),
+                    react.createElement("div", { style: { color: "var(--dsw-alias-label-secondary)", fontSize: "13px", lineHeight: "1.8" } },
+                        env
+                            ? `uv：${env.uv.installed ? "已安装" : "未安装"}；AstrBot：${env.astrbot.installed ? "已安装" : "未安装"}；NapCat：${env.napcat.installed ? "已安装" : "未安装"}；QQ：${env.qq.installed ? "已安装" : "未安装"}`
+                            : "正在检测环境..."
+                    ),
+                    react.createElement(
+                        "div",
+                        { style: { display: "flex", flexWrap: "wrap", gap: "8px", marginTop: "12px" } },
+                        ["uv", "astrbot", "napcat"].map((component) => react.createElement("button", {
+                            key: component,
+                            style: styles.button,
+                            disabled: busy || (env && env[component] && env[component].installed),
+                            onClick: () => installComponent(component)
+                        }, "安装 " + component))
+                    ),
+                    react.createElement("div", { style: { color: "var(--dsw-alias-label-secondary)", fontSize: "12px", marginTop: "10px" } },
+                        "QQ 客户端需要手动安装。NapCat 安装后如果启动脚本不在默认位置，请在上面填写。"
+                    )
+                ),
+                react.createElement(
+                    "div",
+                    { style: styles.card },
+                    react.createElement("div", { style: styles.label }, "一键配置"),
+                    react.createElement("div", { style: { color: "var(--dsw-alias-label-secondary)", fontSize: "13px", lineHeight: "1.8" } },
+                        "插件会保存上面的设置，安装 AstrBot 适配器，启动 AstrBot 与 NapCat，并打开 AstrBot 网页。登录、模型、人格和平台连接在 AstrBot 网页中完成。"
+                    ),
+                    react.createElement("button", {
+                        style: styles.primaryButton,
+                        disabled: busy,
+                        onClick: runGuidedSetup
+                    }, busy ? "正在配置..." : "保存并自动配置"),
+                    setupResult
+                        ? react.createElement(
+                            "div",
+                            { style: { marginTop: "14px", fontSize: "13px", lineHeight: "1.8" } },
+                            setupResult.error ? react.createElement("div", { style: { color: "#e05c5c" } }, setupResult.error) : null,
+                            (setupResult.steps || []).map((step) => react.createElement("div", { key: step }, "完成：" + step)),
+                            (setupResult.warnings || []).map((warning) => react.createElement("div", { key: warning, style: { color: "#c98a1b" } }, "提示：" + warning)),
+                            setupResult.loginStatus
+                                ? react.createElement("div", { style: { marginTop: "8px" } },
+                                    setupResult.loginStatus.online
+                                        ? (setupResult.loginStatus.setupRequired
+                                            ? "AstrBot 尚未完成首次登录，请在打开的网页中完成设置。"
+                                            : "请在打开的 AstrBot 网页中确认登录并配置模型与人格。")
+                                        : "AstrBot 当前未在线。"
+                                )
+                                : null
+                        )
+                        : null
+                ),
+                react.createElement(
+                    "div",
+                    { style: styles.card },
+                    react.createElement("div", { style: styles.label }, "QQ 登录"),
+                    react.createElement("button", {
+                        style: styles.button,
+                        disabled: busy,
+                        onClick: loadQr
+                    }, "获取二维码"),
+                    qrImg ? react.createElement("img", {
+                        src: qrImg,
+                        alt: "QQ 登录二维码",
+                        style: { display: "block", marginTop: "12px", width: "220px", height: "220px", background: "#fff", borderRadius: "8px" }
+                    }) : null,
+                    qrLink ? react.createElement("div", { style: { marginTop: "10px", fontSize: "12px", wordBreak: "break-all", color: "var(--dsw-alias-label-secondary)" } }, "二维码链接：" + qrLink) : null
+                )
+            );
+
+            const astrbotTab = react.createElement(
+                "div",
+                null,
+                react.createElement(
+                    "div",
+                    { style: styles.card },
+                    react.createElement("div", { style: styles.label }, "AstrBot 网页"),
+                    react.createElement("div", { style: { color: "var(--dsw-alias-label-secondary)", fontSize: "13px", lineHeight: "1.8" } },
+                        "AstrBot 的登录、模型供应商、人格、平台连接和插件配置都在它自己的网页中完成。插件不再收集或保存 AstrBot 账号密码。"
+                    ),
+                    react.createElement(
+                        "div",
+                        { style: { display: "flex", flexWrap: "wrap", gap: "8px", marginTop: "12px" } },
+                        react.createElement("button", { style: styles.primaryButton, disabled: busy, onClick: openAstrbotWebui }, "打开 AstrBot 网页"),
+                        react.createElement("button", { style: styles.button, disabled: busy || astrbotOk, onClick: startBot }, "启动 AstrBot"),
+                        react.createElement("button", { style: styles.button, disabled: busy || !astrbotOk, onClick: () => run("/admin/astrbot/restart") }, "重启 AstrBot")
+                    ),
+                    react.createElement("div", { style: { color: "var(--dsw-alias-label-secondary)", fontSize: "12px", marginTop: "10px" } },
+                        astrbotOk ? "AstrBot 在线（127.0.0.1:6185）" : "AstrBot 离线"
+                    )
+                )
+            );
+
             let content = processTab;
+            if (tab === "setup") content = setupTab;
             if (tab === "install") content = installTab;
-            if (tab === "persona") content = personaTab;
-            if (tab === "model") content = modelTab;
+            if (tab === "astrbot") content = astrbotTab;
             if (tab === "logs") content = logsTab;
 
             return react.createElement(
                 "div",
                 { style: styles.page },
                 react.createElement("div", { style: styles.title }, "聊天机器人"),
-                react.createElement("div", { style: styles.lede }, "启动进程、管理 QQ 登录、调整人格与模型配置。"),
+                react.createElement("div", { style: styles.lede }, "按向导安装组件、启动进程和 QQ 登录；AstrBot 的登录、模型与人格在 AstrBot 网页中配置。"),
                 react.createElement(
                     "div",
                     { style: styles.tabs },

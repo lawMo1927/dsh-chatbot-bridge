@@ -15,9 +15,7 @@
   "astrbot": {
     "dir": "D:\\path\\to\\astrbot",
     "exe": "D:\\path\\to\\astrbot\\uv\\tools\\astrbot\\Scripts\\astrbot.exe",
-    "webui": "http://127.0.0.1:6185",
-    "username": "your-astrbot-username",
-    "password": "your-astrbot-password"
+    "webui": "http://127.0.0.1:6185"
   },
   "napcat": {
     "webui": "http://127.0.0.1:6099",

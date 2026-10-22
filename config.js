@@ -29,9 +29,7 @@ function defaultConfig() {
         astrbot: {
             dir: '',
             exe: '',
-            webui: 'http://127.0.0.1:6185',
-            username: '',
-            password: ''
+            webui: 'http://127.0.0.1:6185'
         },
         napcat: {
             webui: 'http://127.0.0.1:6099',

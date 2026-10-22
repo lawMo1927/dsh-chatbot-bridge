@@ -10,7 +10,7 @@ from astrbot.api import logger, star
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.message_components import File, Plain
 from astrbot.api.provider import ProviderRequest
-from astrbot.core.message.message_event_result import MessageChain, ResultContentType
+from astrbot.core.message.message_event_result import MessageChain, MessageEventResult, ResultContentType
 from astrbot.core.platform.message_type import MessageType
 
 BRIDGE_URL = "http://127.0.0.1:9412"
@@ -323,20 +323,29 @@ class Main(star.Star):
         if not task_id:
             return f"桥接服务返回的内容缺少任务编号，无法确认提交结果：{result}"
         target_session = result.get("sessionId") or session_id or "桥接会话"
-        # 任务回执包含完整提示词，标记为单条消息，避免被分段回复拆开
+        # 回执由适配器生成，包含完整提示词，作为单条消息直接展示
+        if (result.get("mode") or mode) == "steer":
+            receipt = (
+                f"已向正在执行的任务追加指令（任务编号 {task_id}，会话 {target_session}），"
+                f"追加的提示词是：\n\n{prompt.strip()}"
+            )
+        else:
+            receipt = (
+                f"已交给 DSH（任务编号 {task_id}，会话 {target_session}），"
+                f"我发出的提示词是：\n\n{prompt.strip()}"
+            )
+        event.set_extra("dsh_receipt_text", receipt)
         event.set_extra("dsh_single_message", True)
         if (result.get("mode") or mode) == "steer":
             return (
                 f"已向正在执行的任务追加指令（任务编号 {task_id}，会话 {target_session}）。"
-                "追加内容会由 DSH 在当前回合一并处理，最终结果和产物文件会由桥接层自动发送给用户。"
-                "现在请立即向用户输出一句简短自然的回执，然后把追加的提示词原样附上"
-                "（可以用代码块或引号）。回执发完后停下，不要调用其他工具，也不要查进度。"
+                "回执已由插件生成并发送，你不需要再重复提示词。"
+                "现在请立即向用户输出一句极短的确认，回执发完后停下，不要调用其他工具。"
             )
         return (
             f"已把提示词提交给 DSH（任务编号 {task_id}，会话 {target_session}）。"
-            "任务结果和产物文件会由桥接层自动发送给用户。"
-            "现在请立即向用户输出一句简短自然的回执，说明已转交，并把发给 DSH 的提示词原样附上"
-            "（可以用代码块或引号）。回执发完后停下，不要调用其他工具，也不要查进度。"
+            "回执已由插件生成并发送，你不需要再重复提示词。"
+            "现在请立即向用户输出一句极短的确认，回执发完后停下，不要调用其他工具。"
         )
 
     @filter.llm_tool(name="dsh_task")
@@ -615,12 +624,15 @@ class Main(star.Star):
         new_task_id = result.get("taskId")
         if not new_task_id:
             return f"桥接服务返回的内容缺少任务编号，无法确认提交结果：{result}"
-        event.set_extra("dsh_single_message", True)
         session_id = result.get("sessionId")
         suffix = f"，会话 {session_id}" if session_id else ""
+        receipt = f"已提交继续指令（新任务编号 {new_task_id}{suffix}），我发出的提示词是：\n\n{payload['prompt']}"
+        event.set_extra("dsh_receipt_text", receipt)
+        event.set_extra("dsh_single_message", True)
         return (
             f"已提交继续指令（新任务编号 {new_task_id}{suffix}）。"
-            "现在请立即向用户回一句简短自然的回执，说明任务已继续，然后停下，不要调用其他工具。"
+            "回执已由插件生成并发送，你不需要再重复提示词。"
+            "现在请立即向用户回一句极短的确认，然后停下，不要调用其他工具。"
         )
 
     @filter.llm_tool(name="dsh_approval")
@@ -940,6 +952,20 @@ class Main(star.Star):
 
     @filter.on_decorating_result()
     async def on_decorating_result(self, event: AstrMessageEvent) -> None:
+        receipt = event.get_extra("dsh_receipt_text")
+        if receipt:
+            text = str(receipt)
+            result = event.get_result()
+            if result is None:
+                event.set_result(
+                    MessageEventResult(chain=[Plain(text)]).set_result_content_type(
+                        ResultContentType.GENERAL_RESULT
+                    )
+                )
+            else:
+                result.chain = [Plain(text)]
+                result.set_result_content_type(ResultContentType.GENERAL_RESULT)
+            return
         if not event.get_extra("dsh_single_message"):
             return
         result = event.get_result()
